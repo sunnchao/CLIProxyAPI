@@ -23,8 +23,6 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "temperature")
 	rawJSON, _ = sjson.DeleteBytes(rawJSON, "top_p")
 
-	instructions := misc.CodexInstructions(modelName)
-
 	originalInstructions := ""
 	originalInstructionsText := ""
 	originalInstructionsResult := gjson.GetBytes(rawJSON, "instructions")
@@ -32,6 +30,8 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 		originalInstructions = originalInstructionsResult.Raw
 		originalInstructionsText = originalInstructionsResult.String()
 	}
+
+	hasOfficialInstructions, instructions := misc.CodexInstructionsForModel(modelName, originalInstructionsResult.String())
 
 	inputResult := gjson.GetBytes(rawJSON, "input")
 	var inputResults []gjson.Result
@@ -70,7 +70,7 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 		}
 	}
 
-	if instructions == originalInstructions {
+	if hasOfficialInstructions {
 		return rawJSON
 	}
 	// log.Debugf("instructions not matched, %s\n", originalInstructions)
@@ -98,7 +98,7 @@ func ConvertOpenAIResponsesRequestToCodex(modelName string, inputRawJSON []byte,
 		rawJSON, _ = sjson.SetRawBytes(rawJSON, "input", []byte(newInput))
 	}
 
-	rawJSON, _ = sjson.SetRawBytes(rawJSON, "instructions", []byte(instructions))
+	rawJSON, _ = sjson.SetBytes(rawJSON, "instructions", instructions)
 
 	return rawJSON
 }
