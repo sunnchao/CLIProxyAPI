@@ -66,15 +66,15 @@ func ConvertOpenAIRequestToGeminiCLI(modelName string, inputRawJSON []byte, _ bo
 	}
 
 	// Map OpenAI modalities -> Gemini CLI request.generationConfig.responseModalities
-	// e.g. "modalities": ["image", "text"] -> ["Image", "Text"]
+	// e.g. "modalities": ["image", "text"] -> ["IMAGE", "TEXT"]
 	if mods := gjson.GetBytes(rawJSON, "modalities"); mods.Exists() && mods.IsArray() {
 		var responseMods []string
 		for _, m := range mods.Array() {
 			switch strings.ToLower(m.String()) {
 			case "text":
-				responseMods = append(responseMods, "Text")
+				responseMods = append(responseMods, "TEXT")
 			case "image":
-				responseMods = append(responseMods, "Image")
+				responseMods = append(responseMods, "IMAGE")
 			}
 		}
 		if len(responseMods) > 0 {
@@ -250,8 +250,34 @@ func ConvertOpenAIRequestToGeminiCLI(modelName string, inputRawJSON []byte, _ bo
 			if t.Get("type").String() == "function" {
 				fn := t.Get("function")
 				if fn.Exists() && fn.IsObject() {
-					parametersJsonSchema, _ := util.RenameKey(fn.Raw, "parameters", "parametersJsonSchema")
-					out, _ = sjson.SetRawBytes(out, fdPath+".-1", []byte(parametersJsonSchema))
+					fnRaw := fn.Raw
+					if fn.Get("parameters").Exists() {
+						renamed, errRename := util.RenameKey(fnRaw, "parameters", "parametersJsonSchema")
+						if errRename != nil {
+							log.Warnf("Failed to rename parameters for tool '%s': %v", fn.Get("name").String(), errRename)
+						} else {
+							fnRaw = renamed
+						}
+					} else {
+						var errSet error
+						fnRaw, errSet = sjson.Set(fnRaw, "parametersJsonSchema.type", "object")
+						if errSet != nil {
+							log.Warnf("Failed to set default schema type for tool '%s': %v", fn.Get("name").String(), errSet)
+							continue
+						}
+						fnRaw, errSet = sjson.Set(fnRaw, "parametersJsonSchema.properties", map[string]interface{}{})
+						if errSet != nil {
+							log.Warnf("Failed to set default schema properties for tool '%s': %v", fn.Get("name").String(), errSet)
+							continue
+						}
+					}
+
+					tmp, errSet := sjson.SetRawBytes(out, fdPath+".-1", []byte(fnRaw))
+					if errSet != nil {
+						log.Warnf("Failed to append tool declaration for '%s': %v", fn.Get("name").String(), errSet)
+						continue
+					}
+					out = tmp
 				}
 			}
 		}

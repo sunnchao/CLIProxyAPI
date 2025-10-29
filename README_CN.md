@@ -82,6 +82,14 @@ brew install cliproxyapi
 brew services start cliproxyapi
 ```
 
+### 通过 CLIProxyAPI Linux Installer 安装
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/brokechubb/cliproxyapi-installer/refs/heads/master/cliproxyapi-installer | bash
+```
+
+感谢 [brokechubb](https://github.com/brokechubb) 构建了 Linux installer！
+
 ## 使用方法
 
 ### 图形客户端与官方 WebUI
@@ -331,6 +339,9 @@ console.log(await claudeResponse.json());
 | `claude-api-key.api-key`                              | string   | ""                 | Claude API密钥。                                                       |
 | `claude-api-key.base-url`                             | string   | ""                 | 自定义的Claude API端点，如果您使用第三方的API端点。                                    |
 | `claude-api-key.proxy-url`                            | string   | ""                 | 针对该API密钥的代理URL。会覆盖全局proxy-url设置。支持socks5/http/https协议。                 |
+| `claude-api-key.models`                               | object[] | []                 | Model alias entries for this key.                                      |
+| `claude-api-key.models.*.name`                        | string   | ""                 | Upstream Claude model name invoked against the API.                    |
+| `claude-api-key.models.*.alias`                       | string   | ""                 | Client-facing alias that maps to the upstream model name.              |
 | `openai-compatibility`                                | object[] | []                 | 上游OpenAI兼容提供商的配置（名称、基础URL、API密钥、模型）。                                |
 | `openai-compatibility.*.name`                         | string   | ""                 | 提供商的名称。它将被用于用户代理（User Agent）和其他地方。                                  |
 | `openai-compatibility.*.base-url`                     | string   | ""                 | 提供商的基础URL。                                                          |
@@ -338,9 +349,11 @@ console.log(await claudeResponse.json());
 | `openai-compatibility.*.api-key-entries`              | object[] | []                 | API密钥条目，支持可选的每密钥代理配置。优先于api-keys。                                   |
 | `openai-compatibility.*.api-key-entries.*.api-key`    | string   | ""                 | 该条目的API密钥。                                                          |
 | `openai-compatibility.*.api-key-entries.*.proxy-url`  | string   | ""                 | 针对该API密钥的代理URL。会覆盖全局proxy-url设置。支持socks5/http/https协议。                 |
-| `openai-compatibility.*.models`                       | object[] | []                 | 实际的模型名称。                                                            |
-| `openai-compatibility.*.models.*.name`                | string   | ""                 | 提供商支持的模型。                                                           |
-| `openai-compatibility.*.models.*.alias`               | string   | ""                 | 在API中使用的别名。                                                         |
+| `openai-compatibility.*.models`                       | object[] | []                 | Model alias definitions routing client aliases to upstream names.      |
+| `openai-compatibility.*.models.*.name`                | string   | ""                 | Upstream model name invoked against the provider.                      |
+| `openai-compatibility.*.models.*.alias`               | string   | ""                 | Client alias routed to the upstream model.                             |
+
+When `claude-api-key.models` is provided, only the listed aliases are registered for that credential, and the default Claude model catalog is skipped.
 
 ### 配置文件示例
 
@@ -423,7 +436,7 @@ openai-compatibility:
     # api-keys:
     #   - "sk-or-v1-...b780"
     #   - "sk-or-v1-...b781"
-    models: # 提供商支持的模型。
+    models: # 提供商支持的模型。或者你可以使用类似 openrouter://moonshotai/kimi-k2:free 这样的格式来请求未在这里定义的模型
       - name: "moonshotai/kimi-k2:free" # 实际的模型名称。
         alias: "kimi-k2" # 在API中使用的别名。
 ```
@@ -564,12 +577,17 @@ export CODE_ASSIST_ENDPOINT="http://127.0.0.1:8317"
 
 ## Claude Code 的使用方法
 
-启动 CLI Proxy API 服务器, 设置如下系统环境变量 `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL`
+启动 CLI Proxy API 服务器, 设置如下系统环境变量 `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` (或 `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` 对应 1.x.x 版本)
 
 使用 Gemini 模型：
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# 2.x.x 版本
+export ANTHROPIC_DEFAULT_OPUS_MODEL=gemini-2.5-pro
+export ANTHROPIC_DEFAULT_SONNET_MODEL=gemini-2.5-flash
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=gemini-2.5-flash-lite
+# 1.x.x 版本
 export ANTHROPIC_MODEL=gemini-2.5-pro
 export ANTHROPIC_SMALL_FAST_MODEL=gemini-2.5-flash
 ```
@@ -578,6 +596,11 @@ export ANTHROPIC_SMALL_FAST_MODEL=gemini-2.5-flash
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# 2.x.x 版本
+export ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5-high
+export ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5-medium
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5-minimal
+# 1.x.x 版本
 export ANTHROPIC_MODEL=gpt-5
 export ANTHROPIC_SMALL_FAST_MODEL=gpt-5-minimal
 ```
@@ -586,15 +609,24 @@ export ANTHROPIC_SMALL_FAST_MODEL=gpt-5-minimal
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# 2.x.x 版本
+export ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5-codex-high
+export ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5-codex-medium
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5-codex-low
+# 1.x.x 版本
 export ANTHROPIC_MODEL=gpt-5-codex
 export ANTHROPIC_SMALL_FAST_MODEL=gpt-5-codex-low
 ```
-
 
 使用 Claude 模型：
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# 2.x.x 版本
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-1-20250805
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-5-20250929
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-haiku-20241022
+# 1.x.x 版本
 export ANTHROPIC_MODEL=claude-sonnet-4-20250514
 export ANTHROPIC_SMALL_FAST_MODEL=claude-3-5-haiku-20241022
 ```
@@ -603,6 +635,11 @@ export ANTHROPIC_SMALL_FAST_MODEL=claude-3-5-haiku-20241022
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# 2.x.x 版本
+export ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3-coder-plus
+export ANTHROPIC_DEFAULT_SONNET_MODEL=qwen3-coder-plus
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3-coder-flash
+# 1.x.x 版本
 export ANTHROPIC_MODEL=qwen3-coder-plus
 export ANTHROPIC_SMALL_FAST_MODEL=qwen3-coder-flash
 ```
@@ -611,6 +648,11 @@ export ANTHROPIC_SMALL_FAST_MODEL=qwen3-coder-flash
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# 2.x.x 版本
+export ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3-max
+export ANTHROPIC_DEFAULT_SONNET_MODEL=qwen3-coder-plus
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3-235b-a22b-instruct
+# 1.x.x 版本
 export ANTHROPIC_MODEL=qwen3-max
 export ANTHROPIC_SMALL_FAST_MODEL=qwen3-235b-a22b-instruct
 ```

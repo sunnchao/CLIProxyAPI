@@ -156,7 +156,8 @@ func (a *Auth) AccountInfo() (string, string) {
 		if v, ok := a.Metadata["email"].(string); ok {
 			return "oauth", v
 		}
-	} else if a.Attributes != nil {
+	}
+	if a.Attributes != nil {
 		if v := a.Attributes["api_key"]; v != "" {
 			return "api_key", v
 		}

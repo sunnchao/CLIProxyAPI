@@ -68,6 +68,14 @@ brew install cliproxyapi
 brew services start cliproxyapi
 ```
 
+### Installation via CLIProxyAPI Linux Installer
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/brokechubb/cliproxyapi-installer/refs/heads/master/cliproxyapi-installer | bash
+```
+
+Thanks to [brokechubb](https://github.com/brokechubb) for building the Linux installer!
+
 ## Usage
 
 ### GUI Client & Official WebUI
@@ -318,6 +326,9 @@ The server uses a YAML configuration file (`config.yaml`) located in the project
 | `claude-api-key.api-key`                           | string   | ""                 | Claude API key.                                                                                                                                                                           |
 | `claude-api-key.base-url`                          | string   | ""                 | Custom Claude API endpoint, if you use a third-party API endpoint.                                                                                                                        |
 | `claude-api-key.proxy-url`                         | string   | ""                 | Proxy URL for this specific API key. Overrides the global proxy-url setting. Supports socks5/http/https protocols.                                                                        |
+| `claude-api-key.models`                            | object[] | []                 | Model alias entries for this key.                                                                                                                                                         |
+| `claude-api-key.models.*.name`                     | string   | ""                 | Upstream Claude model name invoked against the API.                                                                                                                                       |
+| `claude-api-key.models.*.alias`                    | string   | ""                 | Client-facing alias that maps to the upstream model name.                                                                                                                                 |
 | `openai-compatibility`                             | object[] | []                 | Upstream OpenAI-compatible providers configuration (name, base-url, api-keys, models).                                                                                                    |
 | `openai-compatibility.*.name`                      | string   | ""                 | The name of the provider. It will be used in the user agent and other places.                                                                                                             |
 | `openai-compatibility.*.base-url`                  | string   | ""                 | The base URL of the provider.                                                                                                                                                             |
@@ -325,9 +336,11 @@ The server uses a YAML configuration file (`config.yaml`) located in the project
 | `openai-compatibility.*.api-key-entries`           | object[] | []                 | API key entries with optional per-key proxy configuration. Preferred over api-keys.                                                                                                        |
 | `openai-compatibility.*.api-key-entries.*.api-key` | string   | ""                 | The API key for this entry.                                                                                                                                                               |
 | `openai-compatibility.*.api-key-entries.*.proxy-url` | string | ""                 | Proxy URL for this specific API key. Overrides the global proxy-url setting. Supports socks5/http/https protocols.                                                                      |
-| `openai-compatibility.*.models`                    | object[] | []                 | The actual model name.                                                                                                                                                                    |
-| `openai-compatibility.*.models.*.name`             | string   | ""                 | The models supported by the provider.                                                                                                                                                     |
-| `openai-compatibility.*.models.*.alias`            | string   | ""                 | The alias used in the API.                                                                                                                                                                |
+| `openai-compatibility.*.models`                    | object[] | []                 | Model alias definitions routing client aliases to upstream names.                                                                                                                         |
+| `openai-compatibility.*.models.*.name`             | string   | ""                 | Upstream model name invoked against the provider.                                                                                                                                         |
+| `openai-compatibility.*.models.*.alias`            | string   | ""                 | Client alias routed to the upstream model.                                                                                                                                                |
+
+When `claude-api-key.models` is specified, only the provided aliases are registered in the model registry (mirroring OpenAI compatibility behaviour), and the default Claude catalog is suppressed for that credential.
 
 ### Example Configuration File
 
@@ -410,7 +423,7 @@ openai-compatibility:
     # api-keys:
     #   - "sk-or-v1-...b780"
     #   - "sk-or-v1-...b781"
-    models: # The models supported by the provider.
+    models: # The models supported by the provider. Or you can use a format such as openrouter://moonshotai/kimi-k2:free to request undefined models
       - name: "moonshotai/kimi-k2:free" # The actual model name.
         alias: "kimi-k2" # The alias used in the API.
 ```
@@ -556,12 +569,17 @@ The server will relay the `loadCodeAssist`, `onboardUser`, and `countTokens` req
 
 ## Claude Code with multiple account load balancing
 
-Start CLI Proxy API server, and then set the `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` environment variables.
+Start CLI Proxy API server, and then set the `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_DEFAULT_OPUS_MODEL`, `ANTHROPIC_DEFAULT_SONNET_MODEL`, `ANTHROPIC_DEFAULT_HAIKU_MODEL` (or `ANTHROPIC_MODEL`, `ANTHROPIC_SMALL_FAST_MODEL` for version 1.x.x) environment variables.
 
 Using Gemini models:
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# version 2.x.x
+export ANTHROPIC_DEFAULT_OPUS_MODEL=gemini-2.5-pro
+export ANTHROPIC_DEFAULT_SONNET_MODEL=gemini-2.5-flash
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=gemini-2.5-flash-lite
+# version 1.x.x
 export ANTHROPIC_MODEL=gemini-2.5-pro
 export ANTHROPIC_SMALL_FAST_MODEL=gemini-2.5-flash
 ```
@@ -570,6 +588,11 @@ Using OpenAI GPT 5 models:
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# version 2.x.x
+export ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5-high
+export ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5-medium
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5-minimal
+# version 1.x.x
 export ANTHROPIC_MODEL=gpt-5
 export ANTHROPIC_SMALL_FAST_MODEL=gpt-5-minimal
 ```
@@ -578,6 +601,11 @@ Using OpenAI GPT 5 Codex models:
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# version 2.x.x
+export ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5-codex-high
+export ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5-codex-medium
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5-codex-low
+# version 1.x.x
 export ANTHROPIC_MODEL=gpt-5-codex
 export ANTHROPIC_SMALL_FAST_MODEL=gpt-5-codex-low
 ```
@@ -586,6 +614,11 @@ Using Claude models:
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# version 2.x.x
+export ANTHROPIC_DEFAULT_OPUS_MODEL=claude-opus-4-1-20250805
+export ANTHROPIC_DEFAULT_SONNET_MODEL=claude-sonnet-4-5-20250929
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=claude-3-5-haiku-20241022
+# version 1.x.x
 export ANTHROPIC_MODEL=claude-sonnet-4-20250514
 export ANTHROPIC_SMALL_FAST_MODEL=claude-3-5-haiku-20241022
 ```
@@ -594,6 +627,11 @@ Using Qwen models:
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# version 2.x.x
+export ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3-coder-plus
+export ANTHROPIC_DEFAULT_SONNET_MODEL=qwen3-coder-plus
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3-coder-flash
+# version 1.x.x
 export ANTHROPIC_MODEL=qwen3-coder-plus
 export ANTHROPIC_SMALL_FAST_MODEL=qwen3-coder-flash
 ```
@@ -602,6 +640,11 @@ Using iFlow models:
 ```bash
 export ANTHROPIC_BASE_URL=http://127.0.0.1:8317
 export ANTHROPIC_AUTH_TOKEN=sk-dummy
+# version 2.x.x
+export ANTHROPIC_DEFAULT_OPUS_MODEL=qwen3-max
+export ANTHROPIC_DEFAULT_SONNET_MODEL=qwen3-coder-plus
+export ANTHROPIC_DEFAULT_HAIKU_MODEL=qwen3-235b-a22b-instruct
+# version 1.x.x
 export ANTHROPIC_MODEL=qwen3-max
 export ANTHROPIC_SMALL_FAST_MODEL=qwen3-235b-a22b-instruct
 ```
