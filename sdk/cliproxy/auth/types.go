@@ -1,7 +1,12 @@
 package auth
 
 import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
+	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -10,12 +15,43 @@ import (
 	baseauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth"
 )
 
+// PostAuthHook defines a function that is called after an Auth record is created
+// but before it is persisted to storage. This allows for modification of the
+// Auth record (e.g., injecting metadata) based on external context.
+type PostAuthHook func(context.Context, *Auth) error
+
+// RequestInfo holds information extracted from the HTTP request.
+// It is injected into the context passed to PostAuthHook.
+type RequestInfo struct {
+	Query   url.Values
+	Headers http.Header
+}
+
+type requestInfoKey struct{}
+
+// WithRequestInfo returns a new context with the given RequestInfo attached.
+func WithRequestInfo(ctx context.Context, info *RequestInfo) context.Context {
+	return context.WithValue(ctx, requestInfoKey{}, info)
+}
+
+// GetRequestInfo retrieves the RequestInfo from the context, if present.
+func GetRequestInfo(ctx context.Context) *RequestInfo {
+	if val, ok := ctx.Value(requestInfoKey{}).(*RequestInfo); ok {
+		return val
+	}
+	return nil
+}
+
 // Auth encapsulates the runtime state and metadata associated with a single credential.
 type Auth struct {
 	// ID uniquely identifies the auth record across restarts.
 	ID string `json:"id"`
+	// Index is a stable runtime identifier derived from auth metadata (not persisted).
+	Index string `json:"-"`
 	// Provider is the upstream provider key (e.g. "gemini", "claude").
 	Provider string `json:"provider"`
+	// Prefix optionally namespaces models for routing (e.g., "teamA/gemini-3-pro-preview").
+	Prefix string `json:"prefix,omitempty"`
 	// FileName stores the relative or absolute path of the backing auth file.
 	FileName string `json:"-"`
 	// Storage holds the token persistence implementation used during login flows.
@@ -55,6 +91,8 @@ type Auth struct {
 
 	// Runtime carries non-serialisable data used during execution (in-memory only).
 	Runtime any `json:"-"`
+
+	indexAssigned bool `json:"-"`
 }
 
 // QuotaState contains limiter tracking data for a credential.
@@ -115,6 +153,88 @@ func (a *Auth) Clone() *Auth {
 	return &copyAuth
 }
 
+func stableAuthIndex(seed string) string {
+	seed = strings.TrimSpace(seed)
+	if seed == "" {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(seed))
+	return hex.EncodeToString(sum[:8])
+}
+
+func (a *Auth) indexSeed() string {
+	if a == nil {
+		return ""
+	}
+
+	if fileName := strings.TrimSpace(a.FileName); fileName != "" {
+		return "file:" + fileName
+	}
+
+	providerKey := strings.ToLower(strings.TrimSpace(a.Provider))
+	compatName := ""
+	baseURL := ""
+	apiKey := ""
+	source := ""
+	if a.Attributes != nil {
+		if value := strings.TrimSpace(a.Attributes["provider_key"]); value != "" {
+			providerKey = strings.ToLower(value)
+		}
+		compatName = strings.ToLower(strings.TrimSpace(a.Attributes["compat_name"]))
+		baseURL = strings.TrimSpace(a.Attributes["base_url"])
+		apiKey = strings.TrimSpace(a.Attributes["api_key"])
+		source = strings.TrimSpace(a.Attributes["source"])
+	}
+
+	proxyURL := strings.TrimSpace(a.ProxyURL)
+	hasCredentialIdentity := compatName != "" || baseURL != "" || proxyURL != "" || apiKey != "" || source != ""
+	if providerKey != "" && hasCredentialIdentity {
+		parts := []string{"provider=" + providerKey}
+		if compatName != "" {
+			parts = append(parts, "compat="+compatName)
+		}
+		if baseURL != "" {
+			parts = append(parts, "base="+baseURL)
+		}
+		if proxyURL != "" {
+			parts = append(parts, "proxy="+proxyURL)
+		}
+		if apiKey != "" {
+			parts = append(parts, "api_key="+apiKey)
+		}
+		if source != "" {
+			parts = append(parts, "source="+source)
+		}
+		return "config:" + strings.Join(parts, "\x00")
+	}
+
+	if id := strings.TrimSpace(a.ID); id != "" {
+		return "id:" + id
+	}
+
+	return ""
+}
+
+// EnsureIndex returns a stable index derived from the auth file name or credential identity.
+func (a *Auth) EnsureIndex() string {
+	if a == nil {
+		return ""
+	}
+	if a.indexAssigned && a.Index != "" {
+		return a.Index
+	}
+
+	seed := a.indexSeed()
+	if seed == "" {
+		return ""
+	}
+
+	idx := stableAuthIndex(seed)
+	a.Index = idx
+	a.indexAssigned = true
+	return idx
+}
+
 // Clone duplicates a model state including nested error details.
 func (m *ModelState) Clone() *ModelState {
 	if m == nil {
@@ -130,6 +250,139 @@ func (m *ModelState) Clone() *ModelState {
 		}
 	}
 	return &copyState
+}
+
+func (a *Auth) ProxyInfo() string {
+	if a == nil {
+		return ""
+	}
+	proxyStr := strings.TrimSpace(a.ProxyURL)
+	if proxyStr == "" {
+		return ""
+	}
+	if idx := strings.Index(proxyStr, "://"); idx > 0 {
+		return "via " + proxyStr[:idx] + " proxy"
+	}
+	return "via proxy"
+}
+
+// DisableCoolingOverride returns the auth-file scoped disable_cooling override when present.
+// The value is read from metadata key "disable_cooling" (or legacy "disable-cooling").
+func (a *Auth) DisableCoolingOverride() (bool, bool) {
+	if a == nil || a.Metadata == nil {
+		return false, false
+	}
+	if val, ok := a.Metadata["disable_cooling"]; ok {
+		if parsed, okParse := parseBoolAny(val); okParse {
+			return parsed, true
+		}
+	}
+	if val, ok := a.Metadata["disable-cooling"]; ok {
+		if parsed, okParse := parseBoolAny(val); okParse {
+			return parsed, true
+		}
+	}
+	return false, false
+}
+
+// ToolPrefixDisabled returns whether the proxy_ tool name prefix should be
+// skipped for this auth. When true, tool names are sent to Anthropic unchanged.
+// The value is read from metadata key "tool_prefix_disabled" (or "tool-prefix-disabled").
+func (a *Auth) ToolPrefixDisabled() bool {
+	if a == nil || a.Metadata == nil {
+		return false
+	}
+	for _, key := range []string{"tool_prefix_disabled", "tool-prefix-disabled"} {
+		if val, ok := a.Metadata[key]; ok {
+			if parsed, okParse := parseBoolAny(val); okParse {
+				return parsed
+			}
+		}
+	}
+	return false
+}
+
+// RequestRetryOverride returns the auth-file scoped request_retry override when present.
+// The value is read from metadata key "request_retry" (or legacy "request-retry").
+func (a *Auth) RequestRetryOverride() (int, bool) {
+	if a == nil || a.Metadata == nil {
+		return 0, false
+	}
+	if val, ok := a.Metadata["request_retry"]; ok {
+		if parsed, okParse := parseIntAny(val); okParse {
+			if parsed < 0 {
+				parsed = 0
+			}
+			return parsed, true
+		}
+	}
+	if val, ok := a.Metadata["request-retry"]; ok {
+		if parsed, okParse := parseIntAny(val); okParse {
+			if parsed < 0 {
+				parsed = 0
+			}
+			return parsed, true
+		}
+	}
+	return 0, false
+}
+
+func parseBoolAny(val any) (bool, bool) {
+	switch typed := val.(type) {
+	case bool:
+		return typed, true
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return false, false
+		}
+		parsed, err := strconv.ParseBool(trimmed)
+		if err != nil {
+			return false, false
+		}
+		return parsed, true
+	case float64:
+		return typed != 0, true
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil {
+			return false, false
+		}
+		return parsed != 0, true
+	default:
+		return false, false
+	}
+}
+
+func parseIntAny(val any) (int, bool) {
+	switch typed := val.(type) {
+	case int:
+		return typed, true
+	case int32:
+		return int(typed), true
+	case int64:
+		return int(typed), true
+	case float64:
+		return int(typed), true
+	case json.Number:
+		parsed, err := typed.Int64()
+		if err != nil {
+			return 0, false
+		}
+		return int(parsed), true
+	case string:
+		trimmed := strings.TrimSpace(typed)
+		if trimmed == "" {
+			return 0, false
+		}
+		parsed, err := strconv.Atoi(trimmed)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
 }
 
 func (a *Auth) AccountInfo() (string, string) {
@@ -152,11 +405,29 @@ func (a *Auth) AccountInfo() (string, string) {
 			}
 		}
 	}
-	if a.Metadata != nil {
-		if v, ok := a.Metadata["email"].(string); ok {
-			return "oauth", v
+
+	// For iFlow provider, prioritize OAuth type if email is present
+	if strings.ToLower(a.Provider) == "iflow" {
+		if a.Metadata != nil {
+			if email, ok := a.Metadata["email"].(string); ok {
+				email = strings.TrimSpace(email)
+				if email != "" {
+					return "oauth", email
+				}
+			}
 		}
 	}
+
+	// Check metadata for email first (OAuth-style auth)
+	if a.Metadata != nil {
+		if v, ok := a.Metadata["email"].(string); ok {
+			email := strings.TrimSpace(v)
+			if email != "" {
+				return "oauth", email
+			}
+		}
+	}
+	// Fall back to API key (API-key auth)
 	if a.Attributes != nil {
 		if v := a.Attributes["api_key"]; v != "" {
 			return "api_key", v
@@ -259,6 +530,7 @@ func parseTimeValue(v any) (time.Time, bool) {
 			time.RFC3339,
 			time.RFC3339Nano,
 			"2006-01-02 15:04:05",
+			"2006-01-02 15:04",
 			"2006-01-02T15:04:05Z07:00",
 		}
 		for _, layout := range layouts {

@@ -8,11 +8,11 @@ package gemini
 import (
 	"bytes"
 	"context"
-	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
 
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -45,8 +45,8 @@ type ToolCallAccumulator struct {
 //   - param: A pointer to a parameter object for the conversion.
 //
 // Returns:
-//   - []string: A slice of strings, each containing a Gemini-compatible JSON response.
-func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
+//   - [][]byte: A slice of Gemini-compatible JSON responses.
+func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &ConvertOpenAIResponseToGeminiParams{
 			ToolCallsAccumulator: nil,
@@ -56,8 +56,8 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 	}
 
 	// Handle [DONE] marker
-	if strings.TrimSpace(string(rawJSON)) == "[DONE]" {
-		return []string{}
+	if bytes.Equal(bytes.TrimSpace(rawJSON), []byte("[DONE]")) {
+		return [][]byte{}
 	}
 
 	if bytes.HasPrefix(rawJSON, []byte("data:")) {
@@ -77,47 +77,63 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 		if len(choices.Array()) == 0 {
 			// This is a usage-only chunk, handle usage and return
 			if usage := root.Get("usage"); usage.Exists() {
-				template := `{"candidates":[],"usageMetadata":{}}`
+				template := []byte(`{"candidates":[],"usageMetadata":{}}`)
 
 				// Set model if available
 				if model := root.Get("model"); model.Exists() {
-					template, _ = sjson.Set(template, "model", model.String())
+					template, _ = sjson.SetBytes(template, "model", model.String())
 				}
 
-				usageObj := map[string]interface{}{
-					"promptTokenCount":     usage.Get("prompt_tokens").Int(),
-					"candidatesTokenCount": usage.Get("completion_tokens").Int(),
-					"totalTokenCount":      usage.Get("total_tokens").Int(),
+				template, _ = sjson.SetBytes(template, "usageMetadata.promptTokenCount", usage.Get("prompt_tokens").Int())
+				template, _ = sjson.SetBytes(template, "usageMetadata.candidatesTokenCount", usage.Get("completion_tokens").Int())
+				template, _ = sjson.SetBytes(template, "usageMetadata.totalTokenCount", usage.Get("total_tokens").Int())
+				if reasoningTokens := reasoningTokensFromUsage(usage); reasoningTokens > 0 {
+					template, _ = sjson.SetBytes(template, "usageMetadata.thoughtsTokenCount", reasoningTokens)
 				}
-				template, _ = sjson.Set(template, "usageMetadata", usageObj)
-				return []string{template}
+				return [][]byte{template}
 			}
-			return []string{}
+			return [][]byte{}
 		}
 
-		var results []string
+		var results [][]byte
 
 		choices.ForEach(func(choiceIndex, choice gjson.Result) bool {
 			// Base Gemini response template without finishReason; set when known
-			template := `{"candidates":[{"content":{"parts":[],"role":"model"},"index":0}]}`
+			template := []byte(`{"candidates":[{"content":{"parts":[],"role":"model"},"index":0}]}`)
 
 			// Set model if available
 			if model := root.Get("model"); model.Exists() {
-				template, _ = sjson.Set(template, "model", model.String())
+				template, _ = sjson.SetBytes(template, "model", model.String())
 			}
 
 			_ = int(choice.Get("index").Int()) // choiceIdx not used in streaming
 			delta := choice.Get("delta")
+			baseTemplate := append([]byte(nil), template...)
 
 			// Handle role (only in first chunk)
 			if role := delta.Get("role"); role.Exists() && (*param).(*ConvertOpenAIResponseToGeminiParams).IsFirstChunk {
 				// OpenAI assistant -> Gemini model
 				if role.String() == "assistant" {
-					template, _ = sjson.Set(template, "candidates.0.content.role", "model")
+					template, _ = sjson.SetBytes(template, "candidates.0.content.role", "model")
 				}
 				(*param).(*ConvertOpenAIResponseToGeminiParams).IsFirstChunk = false
 				results = append(results, template)
 				return true
+			}
+
+			var chunkOutputs [][]byte
+
+			// Handle reasoning/thinking delta
+			if reasoning := delta.Get("reasoning_content"); reasoning.Exists() {
+				for _, reasoningText := range extractReasoningTexts(reasoning) {
+					if reasoningText == "" {
+						continue
+					}
+					reasoningTemplate := append([]byte(nil), baseTemplate...)
+					reasoningTemplate, _ = sjson.SetBytes(reasoningTemplate, "candidates.0.content.parts.0.thought", true)
+					reasoningTemplate, _ = sjson.SetBytes(reasoningTemplate, "candidates.0.content.parts.0.text", reasoningText)
+					chunkOutputs = append(chunkOutputs, reasoningTemplate)
+				}
 			}
 
 			// Handle content delta
@@ -126,13 +142,13 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 				(*param).(*ConvertOpenAIResponseToGeminiParams).ContentAccumulator.WriteString(contentText)
 
 				// Create text part for this delta
-				parts := []interface{}{
-					map[string]interface{}{
-						"text": contentText,
-					},
-				}
-				template, _ = sjson.Set(template, "candidates.0.content.parts", parts)
-				results = append(results, template)
+				contentTemplate := append([]byte(nil), baseTemplate...)
+				contentTemplate, _ = sjson.SetBytes(contentTemplate, "candidates.0.content.parts.0.text", contentText)
+				chunkOutputs = append(chunkOutputs, contentTemplate)
+			}
+
+			if len(chunkOutputs) > 0 {
+				results = append(results, chunkOutputs...)
 				return true
 			}
 
@@ -192,28 +208,17 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 			// Handle finish reason
 			if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
 				geminiFinishReason := mapOpenAIFinishReasonToGemini(finishReason.String())
-				template, _ = sjson.Set(template, "candidates.0.finishReason", geminiFinishReason)
+				template, _ = sjson.SetBytes(template, "candidates.0.finishReason", geminiFinishReason)
 
 				// If we have accumulated tool calls, output them now
 				if len((*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator) > 0 {
-					var parts []interface{}
+					partIndex := 0
 					for _, accumulator := range (*param).(*ConvertOpenAIResponseToGeminiParams).ToolCallsAccumulator {
-						argsStr := accumulator.Arguments.String()
-						var argsMap map[string]interface{}
-
-						argsMap = parseArgsToMap(argsStr)
-
-						functionCallPart := map[string]interface{}{
-							"functionCall": map[string]interface{}{
-								"name": accumulator.Name,
-								"args": argsMap,
-							},
-						}
-						parts = append(parts, functionCallPart)
-					}
-
-					if len(parts) > 0 {
-						template, _ = sjson.Set(template, "candidates.0.content.parts", parts)
+						namePath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.name", partIndex)
+						argsPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.args", partIndex)
+						template, _ = sjson.SetBytes(template, namePath, accumulator.Name)
+						template, _ = sjson.SetRawBytes(template, argsPath, []byte(parseArgsToObjectRaw(accumulator.Arguments.String())))
+						partIndex++
 					}
 
 					// Clear accumulators
@@ -226,12 +231,12 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 
 			// Handle usage information
 			if usage := root.Get("usage"); usage.Exists() {
-				usageObj := map[string]interface{}{
-					"promptTokenCount":     usage.Get("prompt_tokens").Int(),
-					"candidatesTokenCount": usage.Get("completion_tokens").Int(),
-					"totalTokenCount":      usage.Get("total_tokens").Int(),
+				template, _ = sjson.SetBytes(template, "usageMetadata.promptTokenCount", usage.Get("prompt_tokens").Int())
+				template, _ = sjson.SetBytes(template, "usageMetadata.candidatesTokenCount", usage.Get("completion_tokens").Int())
+				template, _ = sjson.SetBytes(template, "usageMetadata.totalTokenCount", usage.Get("total_tokens").Int())
+				if reasoningTokens := reasoningTokensFromUsage(usage); reasoningTokens > 0 {
+					template, _ = sjson.SetBytes(template, "usageMetadata.thoughtsTokenCount", reasoningTokens)
 				}
-				template, _ = sjson.Set(template, "usageMetadata", usageObj)
 				results = append(results, template)
 				return true
 			}
@@ -240,7 +245,7 @@ func ConvertOpenAIResponseToGemini(_ context.Context, _ string, originalRequestR
 		})
 		return results
 	}
-	return []string{}
+	return [][]byte{}
 }
 
 // mapOpenAIFinishReasonToGemini maps OpenAI finish reasons to Gemini finish reasons
@@ -259,46 +264,54 @@ func mapOpenAIFinishReasonToGemini(openAIReason string) string {
 	}
 }
 
-// parseArgsToMap safely parses a JSON string of function arguments into a map.
-// It returns an empty map if the input is empty or cannot be parsed as a JSON object.
-func parseArgsToMap(argsStr string) map[string]interface{} {
+// parseArgsToObjectRaw safely parses a JSON string of function arguments into an object JSON string.
+// It returns "{}" if the input is empty or cannot be parsed as a JSON object.
+func parseArgsToObjectRaw(argsStr string) string {
 	trimmed := strings.TrimSpace(argsStr)
 	if trimmed == "" || trimmed == "{}" {
-		return map[string]interface{}{}
+		return "{}"
 	}
 
 	// First try strict JSON
-	var out map[string]interface{}
-	if errUnmarshal := json.Unmarshal([]byte(trimmed), &out); errUnmarshal == nil {
-		return out
+	if gjson.Valid(trimmed) {
+		strict := gjson.Parse(trimmed)
+		if strict.IsObject() {
+			return strict.Raw
+		}
 	}
 
 	// Tolerant parse: handle streams where values are barewords (e.g., 北京, celsius)
-	tolerant := tolerantParseJSONMap(trimmed)
-	if len(tolerant) > 0 {
+	tolerant := tolerantParseJSONObjectRaw(trimmed)
+	if tolerant != "{}" {
 		return tolerant
 	}
 
 	// Fallback: return empty object when parsing fails
-	return map[string]interface{}{}
+	return "{}"
 }
 
-// tolerantParseJSONMap attempts to parse a JSON-like object string into a map, tolerating
+func escapeSjsonPathKey(key string) string {
+	key = strings.ReplaceAll(key, `\`, `\\`)
+	key = strings.ReplaceAll(key, `.`, `\.`)
+	return key
+}
+
+// tolerantParseJSONObjectRaw attempts to parse a JSON-like object string into a JSON object string, tolerating
 // bareword values (unquoted strings) commonly seen during streamed tool calls.
 // Example input: {"location": 北京, "unit": celsius}
-func tolerantParseJSONMap(s string) map[string]interface{} {
+func tolerantParseJSONObjectRaw(s string) string {
 	// Ensure we operate within the outermost braces if present
 	start := strings.Index(s, "{")
 	end := strings.LastIndex(s, "}")
 	if start == -1 || end == -1 || start >= end {
-		return map[string]interface{}{}
+		return "{}"
 	}
 	content := s[start+1 : end]
 
 	runes := []rune(content)
 	n := len(runes)
 	i := 0
-	result := make(map[string]interface{})
+	result := []byte(`{}`)
 
 	for i < n {
 		// Skip whitespace and commas
@@ -324,6 +337,7 @@ func tolerantParseJSONMap(s string) map[string]interface{} {
 			break
 		}
 		keyName := jsonStringTokenToRawString(keyToken)
+		sjsonKey := escapeSjsonPathKey(keyName)
 		i = nextIdx
 
 		// Skip whitespace
@@ -343,17 +357,16 @@ func tolerantParseJSONMap(s string) map[string]interface{} {
 		}
 
 		// Parse value (string, number, object/array, bareword)
-		var value interface{}
 		switch runes[i] {
 		case '"':
 			// JSON string
 			valToken, ni := parseJSONStringRunes(runes, i)
 			if ni == -1 {
 				// Malformed; treat as empty string
-				value = ""
+				result, _ = sjson.SetBytes(result, sjsonKey, "")
 				i = n
 			} else {
-				value = jsonStringTokenToRawString(valToken)
+				result, _ = sjson.SetBytes(result, sjsonKey, jsonStringTokenToRawString(valToken))
 				i = ni
 			}
 		case '{', '[':
@@ -362,11 +375,10 @@ func tolerantParseJSONMap(s string) map[string]interface{} {
 			if ni == -1 {
 				i = n
 			} else {
-				var anyVal interface{}
-				if errUnmarshal := json.Unmarshal([]byte(seg), &anyVal); errUnmarshal == nil {
-					value = anyVal
+				if gjson.Valid(seg) {
+					result, _ = sjson.SetRawBytes(result, sjsonKey, []byte(seg))
 				} else {
-					value = seg
+					result, _ = sjson.SetBytes(result, sjsonKey, seg)
 				}
 				i = ni
 			}
@@ -379,20 +391,18 @@ func tolerantParseJSONMap(s string) map[string]interface{} {
 			token := strings.TrimSpace(string(runes[i:j]))
 			// Interpret common JSON atoms and numbers; otherwise treat as string
 			if token == "true" {
-				value = true
+				result, _ = sjson.SetBytes(result, sjsonKey, true)
 			} else if token == "false" {
-				value = false
+				result, _ = sjson.SetBytes(result, sjsonKey, false)
 			} else if token == "null" {
-				value = nil
+				result, _ = sjson.SetBytes(result, sjsonKey, nil)
 			} else if numVal, ok := tryParseNumber(token); ok {
-				value = numVal
+				result, _ = sjson.SetBytes(result, sjsonKey, numVal)
 			} else {
-				value = token
+				result, _ = sjson.SetBytes(result, sjsonKey, token)
 			}
 			i = j
 		}
-
-		result[keyName] = value
 
 		// Skip trailing whitespace and optional comma before next pair
 		for i < n && (runes[i] == ' ' || runes[i] == '\n' || runes[i] == '\r' || runes[i] == '\t') {
@@ -403,7 +413,7 @@ func tolerantParseJSONMap(s string) map[string]interface{} {
 		}
 	}
 
-	return result
+	return string(result)
 }
 
 // parseJSONStringRunes returns the JSON string token (including quotes) and the index just after it.
@@ -431,9 +441,9 @@ func parseJSONStringRunes(runes []rune, start int) (string, int) {
 
 // jsonStringTokenToRawString converts a JSON string token (including quotes) to a raw Go string value.
 func jsonStringTokenToRawString(token string) string {
-	var s string
-	if errUnmarshal := json.Unmarshal([]byte(token), &s); errUnmarshal == nil {
-		return s
+	r := gjson.Parse(token)
+	if r.Type == gjson.String {
+		return r.String()
 	}
 	// Fallback: strip surrounding quotes if present
 	if len(token) >= 2 && token[0] == '"' && token[len(token)-1] == '"' {
@@ -522,16 +532,16 @@ func tryParseNumber(s string) (interface{}, bool) {
 //   - param: A pointer to a parameter object for the conversion.
 //
 // Returns:
-//   - string: A Gemini-compatible JSON response.
-func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
+//   - []byte: A Gemini-compatible JSON response.
+func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	root := gjson.ParseBytes(rawJSON)
 
 	// Base Gemini response template without finishReason; set when known
-	out := `{"candidates":[{"content":{"parts":[],"role":"model"},"index":0}]}`
+	out := []byte(`{"candidates":[{"content":{"parts":[],"role":"model"},"index":0}]}`)
 
 	// Set model if available
 	if model := root.Get("model"); model.Exists() {
-		out, _ = sjson.Set(out, "model", model.String())
+		out, _ = sjson.SetBytes(out, "model", model.String())
 	}
 
 	// Process choices
@@ -543,17 +553,28 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 			// Set role
 			if role := message.Get("role"); role.Exists() {
 				if role.String() == "assistant" {
-					out, _ = sjson.Set(out, "candidates.0.content.role", "model")
+					out, _ = sjson.SetBytes(out, "candidates.0.content.role", "model")
 				}
 			}
 
-			var parts []interface{}
+			partIndex := 0
+
+			// Handle reasoning content before visible text
+			if reasoning := message.Get("reasoning_content"); reasoning.Exists() {
+				for _, reasoningText := range extractReasoningTexts(reasoning) {
+					if reasoningText == "" {
+						continue
+					}
+					out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.thought", partIndex), true)
+					out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.text", partIndex), reasoningText)
+					partIndex++
+				}
+			}
 
 			// Handle content first
 			if content := message.Get("content"); content.Exists() && content.String() != "" {
-				parts = append(parts, map[string]interface{}{
-					"text": content.String(),
-				})
+				out, _ = sjson.SetBytes(out, fmt.Sprintf("candidates.0.content.parts.%d.text", partIndex), content.String())
+				partIndex++
 			}
 
 			// Handle tool calls
@@ -564,35 +585,24 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 						functionName := function.Get("name").String()
 						functionArgs := function.Get("arguments").String()
 
-						// Parse arguments
-						var argsMap map[string]interface{}
-						argsMap = parseArgsToMap(functionArgs)
-
-						functionCallPart := map[string]interface{}{
-							"functionCall": map[string]interface{}{
-								"name": functionName,
-								"args": argsMap,
-							},
-						}
-						parts = append(parts, functionCallPart)
+						namePath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.name", partIndex)
+						argsPath := fmt.Sprintf("candidates.0.content.parts.%d.functionCall.args", partIndex)
+						out, _ = sjson.SetBytes(out, namePath, functionName)
+						out, _ = sjson.SetRawBytes(out, argsPath, []byte(parseArgsToObjectRaw(functionArgs)))
+						partIndex++
 					}
 					return true
 				})
 			}
 
-			// Set parts
-			if len(parts) > 0 {
-				out, _ = sjson.Set(out, "candidates.0.content.parts", parts)
-			}
-
 			// Handle finish reason
 			if finishReason := choice.Get("finish_reason"); finishReason.Exists() {
 				geminiFinishReason := mapOpenAIFinishReasonToGemini(finishReason.String())
-				out, _ = sjson.Set(out, "candidates.0.finishReason", geminiFinishReason)
+				out, _ = sjson.SetBytes(out, "candidates.0.finishReason", geminiFinishReason)
 			}
 
 			// Set index
-			out, _ = sjson.Set(out, "candidates.0.index", choiceIdx)
+			out, _ = sjson.SetBytes(out, "candidates.0.index", choiceIdx)
 
 			return true
 		})
@@ -600,17 +610,57 @@ func ConvertOpenAIResponseToGeminiNonStream(_ context.Context, _ string, origina
 
 	// Handle usage information
 	if usage := root.Get("usage"); usage.Exists() {
-		usageObj := map[string]interface{}{
-			"promptTokenCount":     usage.Get("prompt_tokens").Int(),
-			"candidatesTokenCount": usage.Get("completion_tokens").Int(),
-			"totalTokenCount":      usage.Get("total_tokens").Int(),
+		out, _ = sjson.SetBytes(out, "usageMetadata.promptTokenCount", usage.Get("prompt_tokens").Int())
+		out, _ = sjson.SetBytes(out, "usageMetadata.candidatesTokenCount", usage.Get("completion_tokens").Int())
+		out, _ = sjson.SetBytes(out, "usageMetadata.totalTokenCount", usage.Get("total_tokens").Int())
+		if reasoningTokens := reasoningTokensFromUsage(usage); reasoningTokens > 0 {
+			out, _ = sjson.SetBytes(out, "usageMetadata.thoughtsTokenCount", reasoningTokens)
 		}
-		out, _ = sjson.Set(out, "usageMetadata", usageObj)
 	}
 
 	return out
 }
 
-func GeminiTokenCount(ctx context.Context, count int64) string {
-	return fmt.Sprintf(`{"totalTokens":%d,"promptTokensDetails":[{"modality":"TEXT","tokenCount":%d}]}`, count, count)
+func GeminiTokenCount(ctx context.Context, count int64) []byte {
+	return translatorcommon.GeminiTokenCountJSON(count)
+}
+
+func reasoningTokensFromUsage(usage gjson.Result) int64 {
+	if usage.Exists() {
+		if v := usage.Get("completion_tokens_details.reasoning_tokens"); v.Exists() {
+			return v.Int()
+		}
+		if v := usage.Get("output_tokens_details.reasoning_tokens"); v.Exists() {
+			return v.Int()
+		}
+	}
+	return 0
+}
+
+func extractReasoningTexts(node gjson.Result) []string {
+	var texts []string
+	if !node.Exists() {
+		return texts
+	}
+
+	if node.IsArray() {
+		node.ForEach(func(_, value gjson.Result) bool {
+			texts = append(texts, extractReasoningTexts(value)...)
+			return true
+		})
+		return texts
+	}
+
+	switch node.Type {
+	case gjson.String:
+		texts = append(texts, node.String())
+	case gjson.JSON:
+		if text := node.Get("text"); text.Exists() {
+			texts = append(texts, text.String())
+		} else if raw := strings.TrimSpace(node.Raw); raw != "" && !strings.HasPrefix(raw, "{") && !strings.HasPrefix(raw, "[") {
+			texts = append(texts, raw)
+		}
+	}
+
+	return texts
 }

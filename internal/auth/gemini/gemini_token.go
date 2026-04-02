@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	log "github.com/sirupsen/logrus"
@@ -34,11 +35,21 @@ type GeminiTokenStorage struct {
 
 	// Type indicates the authentication provider type, always "gemini" for this storage.
 	Type string `json:"type"`
+
+	// Metadata holds arbitrary key-value pairs injected via hooks.
+	// It is not exported to JSON directly to allow flattening during serialization.
+	Metadata map[string]any `json:"-"`
+}
+
+// SetMetadata allows external callers to inject metadata into the storage before saving.
+func (ts *GeminiTokenStorage) SetMetadata(meta map[string]any) {
+	ts.Metadata = meta
 }
 
 // SaveTokenToFile serializes the Gemini token storage to a JSON file.
 // This method creates the necessary directory structure and writes the token
 // data in JSON format to the specified file path for persistent storage.
+// It merges any injected metadata into the top-level JSON object.
 //
 // Parameters:
 //   - authFilePath: The full path where the token file should be saved
@@ -48,6 +59,11 @@ type GeminiTokenStorage struct {
 func (ts *GeminiTokenStorage) SaveTokenToFile(authFilePath string) error {
 	misc.LogSavingCredentials(authFilePath)
 	ts.Type = "gemini"
+	// Merge metadata using helper
+	data, errMerge := misc.MergeMetadata(ts, ts.Metadata)
+	if errMerge != nil {
+		return fmt.Errorf("failed to merge metadata: %w", errMerge)
+	}
 	if err := os.MkdirAll(filepath.Dir(authFilePath), 0700); err != nil {
 		return fmt.Errorf("failed to create directory: %v", err)
 	}
@@ -62,8 +78,27 @@ func (ts *GeminiTokenStorage) SaveTokenToFile(authFilePath string) error {
 		}
 	}()
 
-	if err = json.NewEncoder(f).Encode(ts); err != nil {
+	enc := json.NewEncoder(f)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(data); err != nil {
 		return fmt.Errorf("failed to write token to file: %w", err)
 	}
 	return nil
+}
+
+// CredentialFileName returns the filename used to persist Gemini CLI credentials.
+// When projectID represents multiple projects (comma-separated or literal ALL),
+// the suffix is normalized to "all" and a "gemini-" prefix is enforced to keep
+// web and CLI generated files consistent.
+func CredentialFileName(email, projectID string, includeProviderPrefix bool) string {
+	email = strings.TrimSpace(email)
+	project := strings.TrimSpace(projectID)
+	if strings.EqualFold(project, "all") || strings.Contains(project, ",") {
+		return fmt.Sprintf("gemini-%s-all.json", email)
+	}
+	prefix := ""
+	if includeProviderPrefix {
+		prefix = "gemini-"
+	}
+	return fmt.Sprintf("%s%s-%s.json", prefix, email, project)
 }

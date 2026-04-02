@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/buildinfo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/usage"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
@@ -23,7 +24,14 @@ import (
 type attemptInfo struct {
 	count        int
 	blockedUntil time.Time
+	lastActivity time.Time // track last activity for cleanup
 }
+
+// attemptCleanupInterval controls how often stale IP entries are purged
+const attemptCleanupInterval = 1 * time.Hour
+
+// attemptMaxIdleTime controls how long an IP can be idle before cleanup
+const attemptMaxIdleTime = 2 * time.Hour
 
 // Handler aggregates config reference, persistence path and helpers.
 type Handler struct {
@@ -39,6 +47,7 @@ type Handler struct {
 	allowRemoteOverride bool
 	envSecret           string
 	logDir              string
+	postAuthHook        coreauth.PostAuthHook
 }
 
 // NewHandler creates a new management handler instance.
@@ -46,7 +55,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 	envSecret, _ := os.LookupEnv("MANAGEMENT_PASSWORD")
 	envSecret = strings.TrimSpace(envSecret)
 
-	return &Handler{
+	h := &Handler{
 		cfg:                 cfg,
 		configFilePath:      configFilePath,
 		failedAttempts:      make(map[string]*attemptInfo),
@@ -56,6 +65,43 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
 	}
+	h.startAttemptCleanup()
+	return h
+}
+
+// startAttemptCleanup launches a background goroutine that periodically
+// removes stale IP entries from failedAttempts to prevent memory leaks.
+func (h *Handler) startAttemptCleanup() {
+	go func() {
+		ticker := time.NewTicker(attemptCleanupInterval)
+		defer ticker.Stop()
+		for range ticker.C {
+			h.purgeStaleAttempts()
+		}
+	}()
+}
+
+// purgeStaleAttempts removes IP entries that have been idle beyond attemptMaxIdleTime
+// and whose ban (if any) has expired.
+func (h *Handler) purgeStaleAttempts() {
+	now := time.Now()
+	h.attemptsMu.Lock()
+	defer h.attemptsMu.Unlock()
+	for ip, ai := range h.failedAttempts {
+		// Skip if still banned
+		if !ai.blockedUntil.IsZero() && now.Before(ai.blockedUntil) {
+			continue
+		}
+		// Remove if idle too long
+		if now.Sub(ai.lastActivity) > attemptMaxIdleTime {
+			delete(h.failedAttempts, ip)
+		}
+	}
+}
+
+// NewHandler creates a new management handler instance.
+func NewHandlerWithoutConfigFilePath(cfg *config.Config, manager *coreauth.Manager) *Handler {
+	return NewHandler(cfg, "", manager)
 }
 
 // SetConfig updates the in-memory config reference when the server hot-reloads.
@@ -83,6 +129,11 @@ func (h *Handler) SetLogDirectory(dir string) {
 	h.logDir = dir
 }
 
+// SetPostAuthHook registers a hook to be called after auth record creation but before persistence.
+func (h *Handler) SetPostAuthHook(hook coreauth.PostAuthHook) {
+	h.postAuthHook = hook
+}
+
 // Middleware enforces access control for management endpoints.
 // All requests (local and remote) require a valid management key.
 // Additionally, remote access requires allow-remote-management=true.
@@ -91,6 +142,10 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 	const banDuration = 30 * time.Minute
 
 	return func(c *gin.Context) {
+		c.Header("X-CPA-VERSION", buildinfo.Version)
+		c.Header("X-CPA-COMMIT", buildinfo.Commit)
+		c.Header("X-CPA-BUILD-DATE", buildinfo.BuildDate)
+
 		clientIP := c.ClientIP()
 		localClient := clientIP == "127.0.0.1" || clientIP == "::1"
 		cfg := h.cfg
@@ -139,6 +194,7 @@ func (h *Handler) Middleware() gin.HandlerFunc {
 					h.failedAttempts[clientIP] = aip
 				}
 				aip.count++
+				aip.lastActivity = time.Now()
 				if aip.count >= maxFailures {
 					aip.blockedUntil = time.Now().Add(banDuration)
 					aip.count = 0
@@ -235,16 +291,6 @@ func (h *Handler) updateBoolField(c *gin.Context, set func(bool)) {
 		Value *bool `json:"value"`
 	}
 	if err := c.ShouldBindJSON(&body); err != nil || body.Value == nil {
-		var m map[string]any
-		if err2 := c.ShouldBindJSON(&m); err2 == nil {
-			for _, v := range m {
-				if b, ok := v.(bool); ok {
-					set(b)
-					h.persist(c)
-					return
-				}
-			}
-		}
 		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid body"})
 		return
 	}

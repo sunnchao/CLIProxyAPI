@@ -9,10 +9,10 @@ import (
 	"bufio"
 	"bytes"
 	"context"
-	"fmt"
 	"strings"
 	"time"
 
+	translatorcommon "github.com/router-for-me/CLIProxyAPI/v6/internal/translator/common"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
 )
@@ -30,7 +30,7 @@ type ConvertAnthropicResponseToGeminiParams struct {
 	Model             string
 	CreatedAt         int64
 	ResponseID        string
-	LastStorageOutput string
+	LastStorageOutput []byte
 	IsStreaming       bool
 
 	// Streaming state for tool_use assembly
@@ -52,8 +52,8 @@ type ConvertAnthropicResponseToGeminiParams struct {
 //   - param: A pointer to a parameter object for maintaining state between calls
 //
 // Returns:
-//   - []string: A slice of strings, each containing a Gemini-compatible JSON response
-func ConvertClaudeResponseToGemini(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) []string {
+//   - [][]byte: A slice of Gemini-compatible JSON responses
+func ConvertClaudeResponseToGemini(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, param *any) [][]byte {
 	if *param == nil {
 		*param = &ConvertAnthropicResponseToGeminiParams{
 			Model:      modelName,
@@ -63,7 +63,7 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 	}
 
 	if !bytes.HasPrefix(rawJSON, dataTag) {
-		return []string{}
+		return [][]byte{}
 	}
 	rawJSON = bytes.TrimSpace(rawJSON[5:])
 
@@ -71,24 +71,24 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 	eventType := root.Get("type").String()
 
 	// Base Gemini response template with default values
-	template := `{"candidates":[{"content":{"role":"model","parts":[]}}],"usageMetadata":{"trafficType":"PROVISIONED_THROUGHPUT"},"modelVersion":"","createTime":"","responseId":""}`
+	template := []byte(`{"candidates":[{"content":{"role":"model","parts":[]}}],"usageMetadata":{"trafficType":"PROVISIONED_THROUGHPUT"},"modelVersion":"","createTime":"","responseId":""}`)
 
 	// Set model version
 	if (*param).(*ConvertAnthropicResponseToGeminiParams).Model != "" {
 		// Map Claude model names back to Gemini model names
-		template, _ = sjson.Set(template, "modelVersion", (*param).(*ConvertAnthropicResponseToGeminiParams).Model)
+		template, _ = sjson.SetBytes(template, "modelVersion", (*param).(*ConvertAnthropicResponseToGeminiParams).Model)
 	}
 
 	// Set response ID and creation time
 	if (*param).(*ConvertAnthropicResponseToGeminiParams).ResponseID != "" {
-		template, _ = sjson.Set(template, "responseId", (*param).(*ConvertAnthropicResponseToGeminiParams).ResponseID)
+		template, _ = sjson.SetBytes(template, "responseId", (*param).(*ConvertAnthropicResponseToGeminiParams).ResponseID)
 	}
 
 	// Set creation time to current time if not provided
 	if (*param).(*ConvertAnthropicResponseToGeminiParams).CreatedAt == 0 {
 		(*param).(*ConvertAnthropicResponseToGeminiParams).CreatedAt = time.Now().Unix()
 	}
-	template, _ = sjson.Set(template, "createTime", time.Unix((*param).(*ConvertAnthropicResponseToGeminiParams).CreatedAt, 0).Format(time.RFC3339Nano))
+	template, _ = sjson.SetBytes(template, "createTime", time.Unix((*param).(*ConvertAnthropicResponseToGeminiParams).CreatedAt, 0).Format(time.RFC3339Nano))
 
 	switch eventType {
 	case "message_start":
@@ -97,7 +97,7 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 			(*param).(*ConvertAnthropicResponseToGeminiParams).ResponseID = message.Get("id").String()
 			(*param).(*ConvertAnthropicResponseToGeminiParams).Model = message.Get("model").String()
 		}
-		return []string{}
+		return [][]byte{}
 
 	case "content_block_start":
 		// Start of a content block - record tool_use name by index for functionCall assembly
@@ -112,7 +112,7 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 				}
 			}
 		}
-		return []string{}
+		return [][]byte{}
 
 	case "content_block_delta":
 		// Handle content delta (text, thinking, or tool use arguments)
@@ -123,16 +123,16 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 			case "text_delta":
 				// Regular text content delta for normal response text
 				if text := delta.Get("text"); text.Exists() && text.String() != "" {
-					textPart := `{"text":""}`
-					textPart, _ = sjson.Set(textPart, "text", text.String())
-					template, _ = sjson.SetRaw(template, "candidates.0.content.parts.-1", textPart)
+					textPart := []byte(`{"text":""}`)
+					textPart, _ = sjson.SetBytes(textPart, "text", text.String())
+					template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", textPart)
 				}
 			case "thinking_delta":
 				// Thinking/reasoning content delta for models with reasoning capabilities
 				if text := delta.Get("thinking"); text.Exists() && text.String() != "" {
-					thinkingPart := `{"thought":true,"text":""}`
-					thinkingPart, _ = sjson.Set(thinkingPart, "text", text.String())
-					template, _ = sjson.SetRaw(template, "candidates.0.content.parts.-1", thinkingPart)
+					thinkingPart := []byte(`{"thought":true,"text":""}`)
+					thinkingPart, _ = sjson.SetBytes(thinkingPart, "text", text.String())
+					template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", thinkingPart)
 				}
 			case "input_json_delta":
 				// Tool use input delta - accumulate partial_json by index for later assembly at content_block_stop
@@ -149,10 +149,10 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 				if pj := delta.Get("partial_json"); pj.Exists() {
 					b.WriteString(pj.String())
 				}
-				return []string{}
+				return [][]byte{}
 			}
 		}
-		return []string{template}
+		return [][]byte{template}
 
 	case "content_block_stop":
 		// End of content block - finalize tool calls if any
@@ -170,16 +170,16 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 			}
 		}
 		if name != "" || argsTrim != "" {
-			functionCall := `{"functionCall":{"name":"","args":{}}}`
+			functionCall := []byte(`{"functionCall":{"name":"","args":{}}}`)
 			if name != "" {
-				functionCall, _ = sjson.Set(functionCall, "functionCall.name", name)
+				functionCall, _ = sjson.SetBytes(functionCall, "functionCall.name", name)
 			}
 			if argsTrim != "" {
-				functionCall, _ = sjson.SetRaw(functionCall, "functionCall.args", argsTrim)
+				functionCall, _ = sjson.SetRawBytes(functionCall, "functionCall.args", []byte(argsTrim))
 			}
-			template, _ = sjson.SetRaw(template, "candidates.0.content.parts.-1", functionCall)
-			template, _ = sjson.Set(template, "candidates.0.finishReason", "STOP")
-			(*param).(*ConvertAnthropicResponseToGeminiParams).LastStorageOutput = template
+			template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts.-1", functionCall)
+			template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
+			(*param).(*ConvertAnthropicResponseToGeminiParams).LastStorageOutput = append([]byte(nil), template...)
 			// cleanup used state for this index
 			if (*param).(*ConvertAnthropicResponseToGeminiParams).ToolUseArgs != nil {
 				delete((*param).(*ConvertAnthropicResponseToGeminiParams).ToolUseArgs, idx)
@@ -187,9 +187,9 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 			if (*param).(*ConvertAnthropicResponseToGeminiParams).ToolUseNames != nil {
 				delete((*param).(*ConvertAnthropicResponseToGeminiParams).ToolUseNames, idx)
 			}
-			return []string{template}
+			return [][]byte{template}
 		}
-		return []string{}
+		return [][]byte{}
 
 	case "message_delta":
 		// Handle message-level changes (like stop reason and usage information)
@@ -197,15 +197,15 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 			if stopReason := delta.Get("stop_reason"); stopReason.Exists() {
 				switch stopReason.String() {
 				case "end_turn":
-					template, _ = sjson.Set(template, "candidates.0.finishReason", "STOP")
+					template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
 				case "tool_use":
-					template, _ = sjson.Set(template, "candidates.0.finishReason", "STOP")
+					template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
 				case "max_tokens":
-					template, _ = sjson.Set(template, "candidates.0.finishReason", "MAX_TOKENS")
+					template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "MAX_TOKENS")
 				case "stop_sequence":
-					template, _ = sjson.Set(template, "candidates.0.finishReason", "STOP")
+					template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
 				default:
-					template, _ = sjson.Set(template, "candidates.0.finishReason", "STOP")
+					template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
 				}
 			}
 		}
@@ -216,35 +216,35 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 			outputTokens := usage.Get("output_tokens").Int()
 
 			// Set basic usage metadata according to Gemini API specification
-			template, _ = sjson.Set(template, "usageMetadata.promptTokenCount", inputTokens)
-			template, _ = sjson.Set(template, "usageMetadata.candidatesTokenCount", outputTokens)
-			template, _ = sjson.Set(template, "usageMetadata.totalTokenCount", inputTokens+outputTokens)
+			template, _ = sjson.SetBytes(template, "usageMetadata.promptTokenCount", inputTokens)
+			template, _ = sjson.SetBytes(template, "usageMetadata.candidatesTokenCount", outputTokens)
+			template, _ = sjson.SetBytes(template, "usageMetadata.totalTokenCount", inputTokens+outputTokens)
 
 			// Add cache-related token counts if present (Claude Code API cache fields)
 			if cacheCreationTokens := usage.Get("cache_creation_input_tokens"); cacheCreationTokens.Exists() {
-				template, _ = sjson.Set(template, "usageMetadata.cachedContentTokenCount", cacheCreationTokens.Int())
+				template, _ = sjson.SetBytes(template, "usageMetadata.cachedContentTokenCount", cacheCreationTokens.Int())
 			}
 			if cacheReadTokens := usage.Get("cache_read_input_tokens"); cacheReadTokens.Exists() {
 				// Add cache read tokens to cached content count
 				existingCacheTokens := usage.Get("cache_creation_input_tokens").Int()
 				totalCacheTokens := existingCacheTokens + cacheReadTokens.Int()
-				template, _ = sjson.Set(template, "usageMetadata.cachedContentTokenCount", totalCacheTokens)
+				template, _ = sjson.SetBytes(template, "usageMetadata.cachedContentTokenCount", totalCacheTokens)
 			}
 
 			// Add thinking tokens if present (for models with reasoning capabilities)
 			if thinkingTokens := usage.Get("thinking_tokens"); thinkingTokens.Exists() {
-				template, _ = sjson.Set(template, "usageMetadata.thoughtsTokenCount", thinkingTokens.Int())
+				template, _ = sjson.SetBytes(template, "usageMetadata.thoughtsTokenCount", thinkingTokens.Int())
 			}
 
 			// Set traffic type (required by Gemini API)
-			template, _ = sjson.Set(template, "usageMetadata.trafficType", "PROVISIONED_THROUGHPUT")
+			template, _ = sjson.SetBytes(template, "usageMetadata.trafficType", "PROVISIONED_THROUGHPUT")
 		}
-		template, _ = sjson.Set(template, "candidates.0.finishReason", "STOP")
+		template, _ = sjson.SetBytes(template, "candidates.0.finishReason", "STOP")
 
-		return []string{template}
+		return [][]byte{template}
 	case "message_stop":
 		// Final message with usage information - no additional output needed
-		return []string{}
+		return [][]byte{}
 	case "error":
 		// Handle error responses and convert to Gemini error format
 		errorMsg := root.Get("error.message").String()
@@ -253,59 +253,14 @@ func ConvertClaudeResponseToGemini(_ context.Context, modelName string, original
 		}
 
 		// Create error response in Gemini format
-		errorResponse := `{"error":{"code":400,"message":"","status":"INVALID_ARGUMENT"}}`
-		errorResponse, _ = sjson.Set(errorResponse, "error.message", errorMsg)
-		return []string{errorResponse}
+		errorResponse := []byte(`{"error":{"code":400,"message":"","status":"INVALID_ARGUMENT"}}`)
+		errorResponse, _ = sjson.SetBytes(errorResponse, "error.message", errorMsg)
+		return [][]byte{errorResponse}
 
 	default:
 		// Unknown event type, return empty response
-		return []string{}
+		return [][]byte{}
 	}
-}
-
-// convertArrayToJSON converts []interface{} to JSON array string
-func convertArrayToJSON(arr []interface{}) string {
-	result := "[]"
-	for _, item := range arr {
-		switch itemData := item.(type) {
-		case map[string]interface{}:
-			itemJSON := convertMapToJSON(itemData)
-			result, _ = sjson.SetRaw(result, "-1", itemJSON)
-		case string:
-			result, _ = sjson.Set(result, "-1", itemData)
-		case bool:
-			result, _ = sjson.Set(result, "-1", itemData)
-		case float64, int, int64:
-			result, _ = sjson.Set(result, "-1", itemData)
-		default:
-			result, _ = sjson.Set(result, "-1", itemData)
-		}
-	}
-	return result
-}
-
-// convertMapToJSON converts map[string]interface{} to JSON object string
-func convertMapToJSON(m map[string]interface{}) string {
-	result := "{}"
-	for key, value := range m {
-		switch val := value.(type) {
-		case map[string]interface{}:
-			nestedJSON := convertMapToJSON(val)
-			result, _ = sjson.SetRaw(result, key, nestedJSON)
-		case []interface{}:
-			arrayJSON := convertArrayToJSON(val)
-			result, _ = sjson.SetRaw(result, key, arrayJSON)
-		case string:
-			result, _ = sjson.Set(result, key, val)
-		case bool:
-			result, _ = sjson.Set(result, key, val)
-		case float64, int, int64:
-			result, _ = sjson.Set(result, key, val)
-		default:
-			result, _ = sjson.Set(result, key, val)
-		}
-	}
-	return result
 }
 
 // ConvertClaudeResponseToGeminiNonStream converts a non-streaming Claude Code response to a non-streaming Gemini response.
@@ -320,19 +275,19 @@ func convertMapToJSON(m map[string]interface{}) string {
 //   - param: A pointer to a parameter object for the conversion (unused in current implementation)
 //
 // Returns:
-//   - string: A Gemini-compatible JSON response containing all message content and metadata
-func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) string {
+//   - []byte: A Gemini-compatible JSON response containing all message content and metadata
+func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string, originalRequestRawJSON, requestRawJSON, rawJSON []byte, _ *any) []byte {
 	// Base Gemini response template for non-streaming with default values
-	template := `{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"trafficType":"PROVISIONED_THROUGHPUT"},"modelVersion":"","createTime":"","responseId":""}`
+	template := []byte(`{"candidates":[{"content":{"role":"model","parts":[]},"finishReason":"STOP"}],"usageMetadata":{"trafficType":"PROVISIONED_THROUGHPUT"},"modelVersion":"","createTime":"","responseId":""}`)
 
 	// Set model version
-	template, _ = sjson.Set(template, "modelVersion", modelName)
+	template, _ = sjson.SetBytes(template, "modelVersion", modelName)
 
 	streamingEvents := make([][]byte, 0)
 
 	scanner := bufio.NewScanner(bytes.NewReader(rawJSON))
-	buffer := make([]byte, 20_971_520)
-	scanner.Buffer(buffer, 20_971_520)
+	buffer := make([]byte, 52_428_800) // 50MB
+	scanner.Buffer(buffer, 52_428_800)
 	for scanner.Scan() {
 		line := scanner.Bytes()
 		// log.Debug(string(line))
@@ -349,15 +304,15 @@ func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string,
 		Model:             modelName,
 		CreatedAt:         0,
 		ResponseID:        "",
-		LastStorageOutput: "",
+		LastStorageOutput: nil,
 		IsStreaming:       false,
 		ToolUseNames:      nil,
 		ToolUseArgs:       nil,
 	}
 
 	// Process each streaming event and collect parts
-	var allParts []interface{}
-	var finalUsage map[string]interface{}
+	var allParts [][]byte
+	var finalUsageJSON []byte
 	var responseID string
 	var createdAt int64
 
@@ -405,18 +360,16 @@ func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string,
 				case "text_delta":
 					// Process regular text content
 					if text := delta.Get("text"); text.Exists() && text.String() != "" {
-						partJSON := `{"text":""}`
-						partJSON, _ = sjson.Set(partJSON, "text", text.String())
-						part := gjson.Parse(partJSON).Value().(map[string]interface{})
-						allParts = append(allParts, part)
+						partJSON := []byte(`{"text":""}`)
+						partJSON, _ = sjson.SetBytes(partJSON, "text", text.String())
+						allParts = append(allParts, partJSON)
 					}
 				case "thinking_delta":
 					// Process reasoning/thinking content
 					if text := delta.Get("thinking"); text.Exists() && text.String() != "" {
-						partJSON := `{"thought":true,"text":""}`
-						partJSON, _ = sjson.Set(partJSON, "text", text.String())
-						part := gjson.Parse(partJSON).Value().(map[string]interface{})
-						allParts = append(allParts, part)
+						partJSON := []byte(`{"thought":true,"text":""}`)
+						partJSON, _ = sjson.SetBytes(partJSON, "text", text.String())
+						allParts = append(allParts, partJSON)
 					}
 				case "input_json_delta":
 					// accumulate args partial_json for this index
@@ -449,16 +402,14 @@ func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string,
 				}
 			}
 			if name != "" || argsTrim != "" {
-				functionCallJSON := `{"functionCall":{"name":"","args":{}}}`
+				functionCallJSON := []byte(`{"functionCall":{"name":"","args":{}}}`)
 				if name != "" {
-					functionCallJSON, _ = sjson.Set(functionCallJSON, "functionCall.name", name)
+					functionCallJSON, _ = sjson.SetBytes(functionCallJSON, "functionCall.name", name)
 				}
 				if argsTrim != "" {
-					functionCallJSON, _ = sjson.SetRaw(functionCallJSON, "functionCall.args", argsTrim)
+					functionCallJSON, _ = sjson.SetRawBytes(functionCallJSON, "functionCall.args", []byte(argsTrim))
 				}
-				// Parse back to interface{} for allParts
-				functionCall := gjson.Parse(functionCallJSON).Value().(map[string]interface{})
-				allParts = append(allParts, functionCall)
+				allParts = append(allParts, functionCallJSON)
 				// cleanup used state for this index
 				if newParam.ToolUseArgs != nil {
 					delete(newParam.ToolUseArgs, idx)
@@ -471,48 +422,47 @@ func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string,
 		case "message_delta":
 			// Extract final usage information using sjson for token counts and metadata
 			if usage := root.Get("usage"); usage.Exists() {
-				usageJSON := `{}`
+				usageJSON := []byte(`{}`)
 
 				// Basic token counts for prompt and completion
 				inputTokens := usage.Get("input_tokens").Int()
 				outputTokens := usage.Get("output_tokens").Int()
 
 				// Set basic usage metadata according to Gemini API specification
-				usageJSON, _ = sjson.Set(usageJSON, "promptTokenCount", inputTokens)
-				usageJSON, _ = sjson.Set(usageJSON, "candidatesTokenCount", outputTokens)
-				usageJSON, _ = sjson.Set(usageJSON, "totalTokenCount", inputTokens+outputTokens)
+				usageJSON, _ = sjson.SetBytes(usageJSON, "promptTokenCount", inputTokens)
+				usageJSON, _ = sjson.SetBytes(usageJSON, "candidatesTokenCount", outputTokens)
+				usageJSON, _ = sjson.SetBytes(usageJSON, "totalTokenCount", inputTokens+outputTokens)
 
 				// Add cache-related token counts if present (Claude Code API cache fields)
 				if cacheCreationTokens := usage.Get("cache_creation_input_tokens"); cacheCreationTokens.Exists() {
-					usageJSON, _ = sjson.Set(usageJSON, "cachedContentTokenCount", cacheCreationTokens.Int())
+					usageJSON, _ = sjson.SetBytes(usageJSON, "cachedContentTokenCount", cacheCreationTokens.Int())
 				}
 				if cacheReadTokens := usage.Get("cache_read_input_tokens"); cacheReadTokens.Exists() {
 					// Add cache read tokens to cached content count
 					existingCacheTokens := usage.Get("cache_creation_input_tokens").Int()
 					totalCacheTokens := existingCacheTokens + cacheReadTokens.Int()
-					usageJSON, _ = sjson.Set(usageJSON, "cachedContentTokenCount", totalCacheTokens)
+					usageJSON, _ = sjson.SetBytes(usageJSON, "cachedContentTokenCount", totalCacheTokens)
 				}
 
 				// Add thinking tokens if present (for models with reasoning capabilities)
 				if thinkingTokens := usage.Get("thinking_tokens"); thinkingTokens.Exists() {
-					usageJSON, _ = sjson.Set(usageJSON, "thoughtsTokenCount", thinkingTokens.Int())
+					usageJSON, _ = sjson.SetBytes(usageJSON, "thoughtsTokenCount", thinkingTokens.Int())
 				}
 
 				// Set traffic type (required by Gemini API)
-				usageJSON, _ = sjson.Set(usageJSON, "trafficType", "PROVISIONED_THROUGHPUT")
+				usageJSON, _ = sjson.SetBytes(usageJSON, "trafficType", "PROVISIONED_THROUGHPUT")
 
-				// Convert to map[string]interface{} using gjson
-				finalUsage = gjson.Parse(usageJSON).Value().(map[string]interface{})
+				finalUsageJSON = usageJSON
 			}
 		}
 	}
 
 	// Set response metadata
 	if responseID != "" {
-		template, _ = sjson.Set(template, "responseId", responseID)
+		template, _ = sjson.SetBytes(template, "responseId", responseID)
 	}
 	if createdAt > 0 {
-		template, _ = sjson.Set(template, "createTime", time.Unix(createdAt, 0).Format(time.RFC3339Nano))
+		template, _ = sjson.SetBytes(template, "createTime", time.Unix(createdAt, 0).Format(time.RFC3339Nano))
 	}
 
 	// Consolidate consecutive text parts and thinking parts for cleaner output
@@ -520,31 +470,35 @@ func ConvertClaudeResponseToGeminiNonStream(_ context.Context, modelName string,
 
 	// Set the consolidated parts array
 	if len(consolidatedParts) > 0 {
-		template, _ = sjson.SetRaw(template, "candidates.0.content.parts", convertToJSONString(consolidatedParts))
+		partsJSON := []byte(`[]`)
+		for _, partJSON := range consolidatedParts {
+			partsJSON, _ = sjson.SetRawBytes(partsJSON, "-1", partJSON)
+		}
+		template, _ = sjson.SetRawBytes(template, "candidates.0.content.parts", partsJSON)
 	}
 
 	// Set usage metadata
-	if finalUsage != nil {
-		template, _ = sjson.SetRaw(template, "usageMetadata", convertToJSONString(finalUsage))
+	if len(finalUsageJSON) > 0 {
+		template, _ = sjson.SetRawBytes(template, "usageMetadata", finalUsageJSON)
 	}
 
 	return template
 }
 
-func GeminiTokenCount(ctx context.Context, count int64) string {
-	return fmt.Sprintf(`{"totalTokens":%d,"promptTokensDetails":[{"modality":"TEXT","tokenCount":%d}]}`, count, count)
+func GeminiTokenCount(ctx context.Context, count int64) []byte {
+	return translatorcommon.GeminiTokenCountJSON(count)
 }
 
 // consolidateParts merges consecutive text parts and thinking parts to create a cleaner response.
 // This function processes the parts array to combine adjacent text elements and thinking elements
 // into single consolidated parts, which results in a more readable and efficient response structure.
 // Tool calls and other non-text parts are preserved as separate elements.
-func consolidateParts(parts []interface{}) []interface{} {
+func consolidateParts(parts [][]byte) [][]byte {
 	if len(parts) == 0 {
 		return parts
 	}
 
-	var consolidated []interface{}
+	var consolidated [][]byte
 	var currentTextPart strings.Builder
 	var currentThoughtPart strings.Builder
 	var hasText, hasThought bool
@@ -552,10 +506,9 @@ func consolidateParts(parts []interface{}) []interface{} {
 	flushText := func() {
 		// Flush accumulated text content to the consolidated parts array
 		if hasText && currentTextPart.Len() > 0 {
-			textPartJSON := `{"text":""}`
-			textPartJSON, _ = sjson.Set(textPartJSON, "text", currentTextPart.String())
-			textPart := gjson.Parse(textPartJSON).Value().(map[string]interface{})
-			consolidated = append(consolidated, textPart)
+			textPartJSON := []byte(`{"text":""}`)
+			textPartJSON, _ = sjson.SetBytes(textPartJSON, "text", currentTextPart.String())
+			consolidated = append(consolidated, textPartJSON)
 			currentTextPart.Reset()
 			hasText = false
 		}
@@ -564,44 +517,44 @@ func consolidateParts(parts []interface{}) []interface{} {
 	flushThought := func() {
 		// Flush accumulated thinking content to the consolidated parts array
 		if hasThought && currentThoughtPart.Len() > 0 {
-			thoughtPartJSON := `{"thought":true,"text":""}`
-			thoughtPartJSON, _ = sjson.Set(thoughtPartJSON, "text", currentThoughtPart.String())
-			thoughtPart := gjson.Parse(thoughtPartJSON).Value().(map[string]interface{})
-			consolidated = append(consolidated, thoughtPart)
+			thoughtPartJSON := []byte(`{"thought":true,"text":""}`)
+			thoughtPartJSON, _ = sjson.SetBytes(thoughtPartJSON, "text", currentThoughtPart.String())
+			consolidated = append(consolidated, thoughtPartJSON)
 			currentThoughtPart.Reset()
 			hasThought = false
 		}
 	}
 
-	for _, part := range parts {
-		partMap, ok := part.(map[string]interface{})
-		if !ok {
+	for _, partJSON := range parts {
+		part := gjson.ParseBytes(partJSON)
+		if !part.Exists() || !part.IsObject() {
 			// Flush any pending parts and add this non-text part
 			flushText()
 			flushThought()
-			consolidated = append(consolidated, part)
+			consolidated = append(consolidated, partJSON)
 			continue
 		}
 
-		if thought, isThought := partMap["thought"]; isThought && thought == true {
+		thought := part.Get("thought")
+		if thought.Exists() && thought.Type == gjson.True {
 			// This is a thinking part - flush any pending text first
 			flushText() // Flush any pending text first
 
-			if text, hasTextContent := partMap["text"].(string); hasTextContent {
-				currentThoughtPart.WriteString(text)
+			if text := part.Get("text"); text.Exists() && text.Type == gjson.String {
+				currentThoughtPart.WriteString(text.String())
 				hasThought = true
 			}
-		} else if text, hasTextContent := partMap["text"].(string); hasTextContent {
+		} else if text := part.Get("text"); text.Exists() && text.Type == gjson.String {
 			// This is a regular text part - flush any pending thought first
 			flushThought() // Flush any pending thought first
 
-			currentTextPart.WriteString(text)
+			currentTextPart.WriteString(text.String())
 			hasText = true
 		} else {
 			// This is some other type of part (like function call) - flush both text and thought
 			flushText()
 			flushThought()
-			consolidated = append(consolidated, part)
+			consolidated = append(consolidated, partJSON)
 		}
 	}
 
@@ -610,21 +563,4 @@ func consolidateParts(parts []interface{}) []interface{} {
 	flushText()
 
 	return consolidated
-}
-
-// convertToJSONString converts interface{} to JSON string using sjson/gjson.
-// This function provides a consistent way to serialize different data types to JSON strings
-// for inclusion in the Gemini API response structure.
-func convertToJSONString(v interface{}) string {
-	switch val := v.(type) {
-	case []interface{}:
-		return convertArrayToJSON(val)
-	case map[string]interface{}:
-		return convertMapToJSON(val)
-	default:
-		// For simple types, create a temporary JSON and extract the value
-		temp := `{"temp":null}`
-		temp, _ = sjson.Set(temp, "temp", val)
-		return gjson.Get(temp, "temp").Raw
-	}
 }

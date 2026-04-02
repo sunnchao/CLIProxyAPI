@@ -1,3 +1,6 @@
+// Package executor provides runtime execution capabilities for various AI service providers.
+// This file implements the AI Studio executor that routes requests through a websocket-backed
+// transport for the AI Studio provider.
 package executor
 
 import (
@@ -5,12 +8,14 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/runtime/executor/helps"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/wsrelay"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/executor"
@@ -26,28 +31,100 @@ type AIStudioExecutor struct {
 	cfg      *config.Config
 }
 
-// NewAIStudioExecutor constructs a websocket executor for the provider name.
+// NewAIStudioExecutor creates a new AI Studio executor instance.
+//
+// Parameters:
+//   - cfg: The application configuration
+//   - provider: The provider name
+//   - relay: The websocket relay manager
+//
+// Returns:
+//   - *AIStudioExecutor: A new AI Studio executor instance
 func NewAIStudioExecutor(cfg *config.Config, provider string, relay *wsrelay.Manager) *AIStudioExecutor {
 	return &AIStudioExecutor{provider: strings.ToLower(provider), relay: relay, cfg: cfg}
 }
 
-// Identifier returns the logical provider key for routing.
+// Identifier returns the executor identifier.
 func (e *AIStudioExecutor) Identifier() string { return "aistudio" }
 
-// PrepareRequest is a no-op because websocket transport already injects headers.
+// PrepareRequest prepares the HTTP request for execution (no-op for AI Studio).
 func (e *AIStudioExecutor) PrepareRequest(_ *http.Request, _ *cliproxyauth.Auth) error {
 	return nil
 }
 
+// HttpRequest forwards an arbitrary HTTP request through the websocket relay.
+func (e *AIStudioExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth, req *http.Request) (*http.Response, error) {
+	if req == nil {
+		return nil, fmt.Errorf("aistudio executor: request is nil")
+	}
+	if ctx == nil {
+		ctx = req.Context()
+	}
+	if e.relay == nil {
+		return nil, fmt.Errorf("aistudio executor: ws relay is nil")
+	}
+	if auth == nil || auth.ID == "" {
+		return nil, fmt.Errorf("aistudio executor: missing auth")
+	}
+	httpReq := req.WithContext(ctx)
+	if httpReq.URL == nil || strings.TrimSpace(httpReq.URL.String()) == "" {
+		return nil, fmt.Errorf("aistudio executor: request URL is empty")
+	}
+
+	var body []byte
+	if httpReq.Body != nil {
+		b, errRead := io.ReadAll(httpReq.Body)
+		if errRead != nil {
+			return nil, errRead
+		}
+		body = b
+		httpReq.Body = io.NopCloser(bytes.NewReader(b))
+	}
+
+	wsReq := &wsrelay.HTTPRequest{
+		Method:  httpReq.Method,
+		URL:     httpReq.URL.String(),
+		Headers: httpReq.Header.Clone(),
+		Body:    body,
+	}
+	wsResp, errRelay := e.relay.NonStream(ctx, auth.ID, wsReq)
+	if errRelay != nil {
+		return nil, errRelay
+	}
+	if wsResp == nil {
+		return nil, fmt.Errorf("aistudio executor: ws response is nil")
+	}
+
+	statusText := http.StatusText(wsResp.Status)
+	if statusText == "" {
+		statusText = "Unknown"
+	}
+	resp := &http.Response{
+		StatusCode:    wsResp.Status,
+		Status:        fmt.Sprintf("%d %s", wsResp.Status, statusText),
+		Header:        wsResp.Headers.Clone(),
+		Body:          io.NopCloser(bytes.NewReader(wsResp.Body)),
+		ContentLength: int64(len(wsResp.Body)),
+		Request:       httpReq,
+	}
+	return resp, nil
+}
+
+// Execute performs a non-streaming request to the AI Studio API.
 func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (resp cliproxyexecutor.Response, err error) {
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
-	defer reporter.trackFailure(ctx, &err)
+	if opts.Alt == "responses/compact" {
+		return resp, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
+	}
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	translatedReq, body, err := e.translateRequest(req, opts, false)
 	if err != nil {
 		return resp, err
 	}
-	endpoint := e.buildEndpoint(req.Model, body.action, opts.Alt)
+
+	endpoint := e.buildEndpoint(baseModel, body.action, opts.Alt)
 	wsReq := &wsrelay.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     endpoint,
@@ -61,11 +138,11 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       endpoint,
 		Method:    http.MethodPost,
 		Headers:   wsReq.Headers.Clone(),
-		Body:      bytes.Clone(body.payload),
+		Body:      body.payload,
 		Provider:  e.Identifier(),
 		AuthID:    authID,
 		AuthLabel: authLabel,
@@ -75,32 +152,38 @@ func (e *AIStudioExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth,
 
 	wsResp, err := e.relay.NonStream(ctx, authID, wsReq)
 	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return resp, err
 	}
-	recordAPIResponseMetadata(ctx, e.cfg, wsResp.Status, wsResp.Headers.Clone())
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, wsResp.Status, wsResp.Headers.Clone())
 	if len(wsResp.Body) > 0 {
-		appendAPIResponseChunk(ctx, e.cfg, bytes.Clone(wsResp.Body))
+		helps.AppendAPIResponseChunk(ctx, e.cfg, wsResp.Body)
 	}
 	if wsResp.Status < 200 || wsResp.Status >= 300 {
 		return resp, statusErr{code: wsResp.Status, msg: string(wsResp.Body)}
 	}
-	reporter.publish(ctx, parseGeminiUsage(wsResp.Body))
+	reporter.Publish(ctx, helps.ParseGeminiUsage(wsResp.Body))
 	var param any
-	out := sdktranslator.TranslateNonStream(ctx, body.toFormat, opts.SourceFormat, req.Model, bytes.Clone(opts.OriginalRequest), bytes.Clone(translatedReq), bytes.Clone(wsResp.Body), &param)
-	resp = cliproxyexecutor.Response{Payload: ensureColonSpacedJSON([]byte(out))}
+	out := sdktranslator.TranslateNonStream(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, wsResp.Body, &param)
+	resp = cliproxyexecutor.Response{Payload: ensureColonSpacedJSON(out), Headers: wsResp.Headers.Clone()}
 	return resp, nil
 }
 
-func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (stream <-chan cliproxyexecutor.StreamChunk, err error) {
-	reporter := newUsageReporter(ctx, e.Identifier(), req.Model, auth)
-	defer reporter.trackFailure(ctx, &err)
+// ExecuteStream performs a streaming request to the AI Studio API.
+func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (_ *cliproxyexecutor.StreamResult, err error) {
+	if opts.Alt == "responses/compact" {
+		return nil, statusErr{code: http.StatusNotImplemented, msg: "/responses/compact not supported"}
+	}
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+	reporter := helps.NewUsageReporter(ctx, e.Identifier(), baseModel, auth)
+	defer reporter.TrackFailure(ctx, &err)
 
 	translatedReq, body, err := e.translateRequest(req, opts, true)
 	if err != nil {
 		return nil, err
 	}
-	endpoint := e.buildEndpoint(req.Model, body.action, opts.Alt)
+
+	endpoint := e.buildEndpoint(baseModel, body.action, opts.Alt)
 	wsReq := &wsrelay.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     endpoint,
@@ -113,11 +196,11 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       endpoint,
 		Method:    http.MethodPost,
 		Headers:   wsReq.Headers.Clone(),
-		Body:      bytes.Clone(body.payload),
+		Body:      body.payload,
 		Provider:  e.Identifier(),
 		AuthID:    authID,
 		AuthLabel: authLabel,
@@ -126,69 +209,121 @@ func (e *AIStudioExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth
 	})
 	wsStream, err := e.relay.Stream(ctx, authID, wsReq)
 	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return nil, err
 	}
+	firstEvent, ok := <-wsStream
+	if !ok {
+		err = fmt.Errorf("wsrelay: stream closed before start")
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
+		return nil, err
+	}
+	if firstEvent.Status > 0 && firstEvent.Status != http.StatusOK {
+		metadataLogged := false
+		if firstEvent.Status > 0 {
+			helps.RecordAPIResponseMetadata(ctx, e.cfg, firstEvent.Status, firstEvent.Headers.Clone())
+			metadataLogged = true
+		}
+		var body bytes.Buffer
+		if len(firstEvent.Payload) > 0 {
+			helps.AppendAPIResponseChunk(ctx, e.cfg, firstEvent.Payload)
+			body.Write(firstEvent.Payload)
+		}
+		if firstEvent.Type == wsrelay.MessageTypeStreamEnd {
+			return nil, statusErr{code: firstEvent.Status, msg: body.String()}
+		}
+		for event := range wsStream {
+			if event.Err != nil {
+				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)
+				if body.Len() == 0 {
+					body.WriteString(event.Err.Error())
+				}
+				break
+			}
+			if !metadataLogged && event.Status > 0 {
+				helps.RecordAPIResponseMetadata(ctx, e.cfg, event.Status, event.Headers.Clone())
+				metadataLogged = true
+			}
+			if len(event.Payload) > 0 {
+				helps.AppendAPIResponseChunk(ctx, e.cfg, event.Payload)
+				body.Write(event.Payload)
+			}
+			if event.Type == wsrelay.MessageTypeStreamEnd {
+				break
+			}
+		}
+		return nil, statusErr{code: firstEvent.Status, msg: body.String()}
+	}
 	out := make(chan cliproxyexecutor.StreamChunk)
-	stream = out
-	go func() {
+	go func(first wsrelay.StreamEvent) {
 		defer close(out)
 		var param any
 		metadataLogged := false
-		for event := range wsStream {
+		processEvent := func(event wsrelay.StreamEvent) bool {
 			if event.Err != nil {
-				recordAPIResponseError(ctx, e.cfg, event.Err)
-				reporter.publishFailure(ctx)
+				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)
+				reporter.PublishFailure(ctx)
 				out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}
-				return
+				return false
 			}
 			switch event.Type {
 			case wsrelay.MessageTypeStreamStart:
 				if !metadataLogged && event.Status > 0 {
-					recordAPIResponseMetadata(ctx, e.cfg, event.Status, event.Headers.Clone())
+					helps.RecordAPIResponseMetadata(ctx, e.cfg, event.Status, event.Headers.Clone())
 					metadataLogged = true
 				}
 			case wsrelay.MessageTypeStreamChunk:
 				if len(event.Payload) > 0 {
-					appendAPIResponseChunk(ctx, e.cfg, bytes.Clone(event.Payload))
-					filtered := filterAIStudioUsageMetadata(event.Payload)
-					if detail, ok := parseGeminiStreamUsage(filtered); ok {
-						reporter.publish(ctx, detail)
+					helps.AppendAPIResponseChunk(ctx, e.cfg, event.Payload)
+					filtered := helps.FilterSSEUsageMetadata(event.Payload)
+					if detail, ok := helps.ParseGeminiStreamUsage(filtered); ok {
+						reporter.Publish(ctx, detail)
 					}
-					lines := sdktranslator.TranslateStream(ctx, body.toFormat, opts.SourceFormat, req.Model, bytes.Clone(opts.OriginalRequest), translatedReq, bytes.Clone(filtered), &param)
+					lines := sdktranslator.TranslateStream(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, filtered, &param)
 					for i := range lines {
-						out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON([]byte(lines[i]))}
+						out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}
 					}
 					break
 				}
 			case wsrelay.MessageTypeStreamEnd:
-				return
+				return false
 			case wsrelay.MessageTypeHTTPResp:
 				if !metadataLogged && event.Status > 0 {
-					recordAPIResponseMetadata(ctx, e.cfg, event.Status, event.Headers.Clone())
+					helps.RecordAPIResponseMetadata(ctx, e.cfg, event.Status, event.Headers.Clone())
 					metadataLogged = true
 				}
 				if len(event.Payload) > 0 {
-					appendAPIResponseChunk(ctx, e.cfg, bytes.Clone(event.Payload))
+					helps.AppendAPIResponseChunk(ctx, e.cfg, event.Payload)
 				}
-				lines := sdktranslator.TranslateStream(ctx, body.toFormat, opts.SourceFormat, req.Model, bytes.Clone(opts.OriginalRequest), translatedReq, bytes.Clone(event.Payload), &param)
+				lines := sdktranslator.TranslateStream(ctx, body.toFormat, opts.SourceFormat, req.Model, opts.OriginalRequest, translatedReq, event.Payload, &param)
 				for i := range lines {
-					out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON([]byte(lines[i]))}
+					out <- cliproxyexecutor.StreamChunk{Payload: ensureColonSpacedJSON(lines[i])}
 				}
-				reporter.publish(ctx, parseGeminiUsage(event.Payload))
-				return
+				reporter.Publish(ctx, helps.ParseGeminiUsage(event.Payload))
+				return false
 			case wsrelay.MessageTypeError:
-				recordAPIResponseError(ctx, e.cfg, event.Err)
-				reporter.publishFailure(ctx)
+				helps.RecordAPIResponseError(ctx, e.cfg, event.Err)
+				reporter.PublishFailure(ctx)
 				out <- cliproxyexecutor.StreamChunk{Err: fmt.Errorf("wsrelay: %v", event.Err)}
+				return false
+			}
+			return true
+		}
+		if !processEvent(first) {
+			return
+		}
+		for event := range wsStream {
+			if !processEvent(event) {
 				return
 			}
 		}
-	}()
-	return stream, nil
+	}(firstEvent)
+	return &cliproxyexecutor.StreamResult{Headers: firstEvent.Headers.Clone(), Chunks: out}, nil
 }
 
+// CountTokens counts tokens for the given request using the AI Studio API.
 func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.Auth, req cliproxyexecutor.Request, opts cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
 	_, body, err := e.translateRequest(req, opts, false)
 	if err != nil {
 		return cliproxyexecutor.Response{}, err
@@ -196,8 +331,9 @@ func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.A
 
 	body.payload, _ = sjson.DeleteBytes(body.payload, "generationConfig")
 	body.payload, _ = sjson.DeleteBytes(body.payload, "tools")
+	body.payload, _ = sjson.DeleteBytes(body.payload, "safetySettings")
 
-	endpoint := e.buildEndpoint(req.Model, "countTokens", "")
+	endpoint := e.buildEndpoint(baseModel, "countTokens", "")
 	wsReq := &wsrelay.HTTPRequest{
 		Method:  http.MethodPost,
 		URL:     endpoint,
@@ -210,11 +346,11 @@ func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.A
 		authLabel = auth.Label
 		authType, authValue = auth.AccountInfo()
 	}
-	recordAPIRequest(ctx, e.cfg, upstreamRequestLog{
+	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
 		URL:       endpoint,
 		Method:    http.MethodPost,
 		Headers:   wsReq.Headers.Clone(),
-		Body:      bytes.Clone(body.payload),
+		Body:      body.payload,
 		Provider:  e.Identifier(),
 		AuthID:    authID,
 		AuthLabel: authLabel,
@@ -223,12 +359,12 @@ func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.A
 	})
 	resp, err := e.relay.NonStream(ctx, authID, wsReq)
 	if err != nil {
-		recordAPIResponseError(ctx, e.cfg, err)
+		helps.RecordAPIResponseError(ctx, e.cfg, err)
 		return cliproxyexecutor.Response{}, err
 	}
-	recordAPIResponseMetadata(ctx, e.cfg, resp.Status, resp.Headers.Clone())
+	helps.RecordAPIResponseMetadata(ctx, e.cfg, resp.Status, resp.Headers.Clone())
 	if len(resp.Body) > 0 {
-		appendAPIResponseChunk(ctx, e.cfg, bytes.Clone(resp.Body))
+		helps.AppendAPIResponseChunk(ctx, e.cfg, resp.Body)
 	}
 	if resp.Status < 200 || resp.Status >= 300 {
 		return cliproxyexecutor.Response{}, statusErr{code: resp.Status, msg: string(resp.Body)}
@@ -237,12 +373,12 @@ func (e *AIStudioExecutor) CountTokens(ctx context.Context, auth *cliproxyauth.A
 	if totalTokens <= 0 {
 		return cliproxyexecutor.Response{}, fmt.Errorf("wsrelay: totalTokens missing in response")
 	}
-	translated := sdktranslator.TranslateTokenCount(ctx, body.toFormat, opts.SourceFormat, totalTokens, bytes.Clone(resp.Body))
-	return cliproxyexecutor.Response{Payload: []byte(translated)}, nil
+	translated := sdktranslator.TranslateTokenCount(ctx, body.toFormat, opts.SourceFormat, totalTokens, resp.Body)
+	return cliproxyexecutor.Response{Payload: translated}, nil
 }
 
-func (e *AIStudioExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
-	_ = ctx
+// Refresh refreshes the authentication credentials (no-op for AI Studio).
+func (e *AIStudioExecutor) Refresh(_ context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	return auth, nil
 }
 
@@ -253,14 +389,27 @@ type translatedPayload struct {
 }
 
 func (e *AIStudioExecutor) translateRequest(req cliproxyexecutor.Request, opts cliproxyexecutor.Options, stream bool) ([]byte, translatedPayload, error) {
+	baseModel := thinking.ParseSuffix(req.Model).ModelName
+
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("gemini")
-	payload := sdktranslator.TranslateRequest(from, to, req.Model, bytes.Clone(req.Payload), stream)
-	if budgetOverride, includeOverride, ok := util.GeminiThinkingFromMetadata(req.Metadata); ok {
-		payload = util.ApplyGeminiThinkingConfig(payload, budgetOverride, includeOverride)
+	originalPayloadSource := req.Payload
+	if len(opts.OriginalRequest) > 0 {
+		originalPayloadSource = opts.OriginalRequest
 	}
-	payload = disableGeminiThinkingConfig(payload, req.Model)
-	payload = fixGeminiImageAspectRatio(req.Model, payload)
+	originalPayload := originalPayloadSource
+	originalTranslated := sdktranslator.TranslateRequest(from, to, baseModel, originalPayload, stream)
+	payload := sdktranslator.TranslateRequest(from, to, baseModel, req.Payload, stream)
+	payload, err := thinking.ApplyThinking(payload, req.Model, from.String(), to.String(), e.Identifier())
+	if err != nil {
+		return nil, translatedPayload{}, err
+	}
+	payload = fixGeminiImageAspectRatio(baseModel, payload)
+	requestedModel := helps.PayloadRequestedModel(opts, req.Model)
+	payload = helps.ApplyPayloadConfigWithRoot(e.cfg, baseModel, to.String(), "", payload, originalTranslated, requestedModel)
+	payload, _ = sjson.DeleteBytes(payload, "generationConfig.maxOutputTokens")
+	payload, _ = sjson.DeleteBytes(payload, "generationConfig.responseMimeType")
+	payload, _ = sjson.DeleteBytes(payload, "generationConfig.responseJsonSchema")
 	metadataAction := "generateContent"
 	if req.Metadata != nil {
 		if action, _ := req.Metadata["action"].(string); action == "countTokens" {
@@ -289,65 +438,6 @@ func (e *AIStudioExecutor) buildEndpoint(model, action, alt string) string {
 	return base
 }
 
-// filterAIStudioUsageMetadata removes usageMetadata from intermediate SSE events so that
-// only the terminal chunk retains token statistics.
-func filterAIStudioUsageMetadata(payload []byte) []byte {
-	if len(payload) == 0 {
-		return payload
-	}
-
-	lines := bytes.Split(payload, []byte("\n"))
-	modified := false
-	for idx, line := range lines {
-		trimmed := bytes.TrimSpace(line)
-		if len(trimmed) == 0 || !bytes.HasPrefix(trimmed, []byte("data:")) {
-			continue
-		}
-		dataIdx := bytes.Index(line, []byte("data:"))
-		if dataIdx < 0 {
-			continue
-		}
-		rawJSON := bytes.TrimSpace(line[dataIdx+5:])
-		cleaned, changed := stripUsageMetadataFromJSON(rawJSON)
-		if !changed {
-			continue
-		}
-		var rebuilt []byte
-		rebuilt = append(rebuilt, line[:dataIdx]...)
-		rebuilt = append(rebuilt, []byte("data:")...)
-		if len(cleaned) > 0 {
-			rebuilt = append(rebuilt, ' ')
-			rebuilt = append(rebuilt, cleaned...)
-		}
-		lines[idx] = rebuilt
-		modified = true
-	}
-	if !modified {
-		return payload
-	}
-	return bytes.Join(lines, []byte("\n"))
-}
-
-// stripUsageMetadataFromJSON drops usageMetadata when no finishReason is present.
-func stripUsageMetadataFromJSON(rawJSON []byte) ([]byte, bool) {
-	jsonBytes := bytes.TrimSpace(rawJSON)
-	if len(jsonBytes) == 0 || !gjson.ValidBytes(jsonBytes) {
-		return rawJSON, false
-	}
-	finishReason := gjson.GetBytes(jsonBytes, "candidates.0.finishReason")
-	if finishReason.Exists() && finishReason.String() != "" {
-		return rawJSON, false
-	}
-	if !gjson.GetBytes(jsonBytes, "usageMetadata").Exists() {
-		return rawJSON, false
-	}
-	cleaned, err := sjson.DeleteBytes(jsonBytes, "usageMetadata")
-	if err != nil {
-		return rawJSON, false
-	}
-	return cleaned, true
-}
-
 // ensureColonSpacedJSON normalizes JSON objects so that colons are followed by a single space while
 // keeping the payload otherwise compact. Non-JSON inputs are returned unchanged.
 func ensureColonSpacedJSON(payload []byte) []byte {
@@ -372,8 +462,16 @@ func ensureColonSpacedJSON(payload []byte) []byte {
 
 	for i := 0; i < len(indented); i++ {
 		ch := indented[i]
-		if ch == '"' && (i == 0 || indented[i-1] != '\\') {
-			inString = !inString
+		if ch == '"' {
+			// A quote is escaped only when preceded by an odd number of consecutive backslashes.
+			// For example: "\\\"" keeps the quote inside the string, but "\\\\" closes the string.
+			backslashes := 0
+			for j := i - 1; j >= 0 && indented[j] == '\\'; j-- {
+				backslashes++
+			}
+			if backslashes%2 == 0 {
+				inString = !inString
+			}
 		}
 
 		if !inString {

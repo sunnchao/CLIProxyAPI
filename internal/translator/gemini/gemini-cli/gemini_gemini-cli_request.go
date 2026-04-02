@@ -6,9 +6,9 @@
 package geminiCLI
 
 import (
-	"bytes"
 	"fmt"
 
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/translator/gemini/common"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	"github.com/tidwall/gjson"
 	"github.com/tidwall/sjson"
@@ -18,7 +18,7 @@ import (
 // It extracts the model name, system instruction, message contents, and tool declarations
 // from the raw JSON request and returns them in the format expected by the internal client.
 func ConvertGeminiCLIRequestToGemini(_ string, inputRawJSON []byte, _ bool) []byte {
-	rawJSON := bytes.Clone(inputRawJSON)
+	rawJSON := inputRawJSON
 	modelResult := gjson.GetBytes(rawJSON, "model")
 	rawJSON = []byte(gjson.GetBytes(rawJSON, "request").Raw)
 	rawJSON, _ = sjson.SetBytes(rawJSON, "model", modelResult.String())
@@ -45,5 +45,19 @@ func ConvertGeminiCLIRequestToGemini(_ string, inputRawJSON []byte, _ bool) []by
 		}
 	}
 
-	return rawJSON
+	gjson.GetBytes(rawJSON, "contents").ForEach(func(key, content gjson.Result) bool {
+		if content.Get("role").String() == "model" {
+			content.Get("parts").ForEach(func(partKey, part gjson.Result) bool {
+				if part.Get("functionCall").Exists() {
+					rawJSON, _ = sjson.SetBytes(rawJSON, fmt.Sprintf("contents.%d.parts.%d.thoughtSignature", key.Int(), partKey.Int()), "skip_thought_signature_validator")
+				} else if part.Get("thoughtSignature").Exists() {
+					rawJSON, _ = sjson.SetBytes(rawJSON, fmt.Sprintf("contents.%d.parts.%d.thoughtSignature", key.Int(), partKey.Int()), "skip_thought_signature_validator")
+				}
+				return true
+			})
+		}
+		return true
+	})
+
+	return common.AttachDefaultSafetySettings(rawJSON, "safetySettings")
 }

@@ -5,12 +5,14 @@ package cliproxy
 
 import (
 	"fmt"
+	"strings"
 
+	configaccess "github.com/router-for-me/CLIProxyAPI/v6/internal/access/config_access"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	sdkaccess "github.com/router-for-me/CLIProxyAPI/v6/sdk/access"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/config"
 )
 
 // Builder constructs a Service instance with customizable providers.
@@ -151,6 +153,16 @@ func (b *Builder) WithLocalManagementPassword(password string) *Builder {
 	return b
 }
 
+// WithPostAuthHook registers a hook to be called after an Auth record is created
+// but before it is persisted to storage.
+func (b *Builder) WithPostAuthHook(hook coreauth.PostAuthHook) *Builder {
+	if hook == nil {
+		return b
+	}
+	b.serverOptions = append(b.serverOptions, api.WithPostAuthHook(hook))
+	return b
+}
+
 // Build validates inputs, applies defaults, and returns a ready-to-run service.
 func (b *Builder) Build() (*Service, error) {
 	if b.cfg == nil {
@@ -185,11 +197,8 @@ func (b *Builder) Build() (*Service, error) {
 		accessManager = sdkaccess.NewManager()
 	}
 
-	providers, err := sdkaccess.BuildProviders(&b.cfg.SDKConfig)
-	if err != nil {
-		return nil, err
-	}
-	accessManager.SetProviders(providers)
+	configaccess.Register(&b.cfg.SDKConfig)
+	accessManager.SetProviders(sdkaccess.RegisteredProviders())
 
 	coreManager := b.coreManager
 	if coreManager == nil {
@@ -197,10 +206,25 @@ func (b *Builder) Build() (*Service, error) {
 		if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok && b.cfg != nil {
 			dirSetter.SetBaseDir(b.cfg.AuthDir)
 		}
-		coreManager = coreauth.NewManager(tokenStore, nil, nil)
+
+		strategy := ""
+		if b.cfg != nil {
+			strategy = strings.ToLower(strings.TrimSpace(b.cfg.Routing.Strategy))
+		}
+		var selector coreauth.Selector
+		switch strategy {
+		case "fill-first", "fillfirst", "ff":
+			selector = &coreauth.FillFirstSelector{}
+		default:
+			selector = &coreauth.RoundRobinSelector{}
+		}
+
+		coreManager = coreauth.NewManager(tokenStore, selector, nil)
 	}
 	// Attach a default RoundTripper provider so providers can opt-in per-auth transports.
 	coreManager.SetRoundTripperProvider(newDefaultRoundTripperProvider())
+	coreManager.SetConfig(b.cfg)
+	coreManager.SetOAuthModelAlias(b.cfg.OAuthModelAlias)
 
 	service := &Service{
 		cfg:            b.cfg,

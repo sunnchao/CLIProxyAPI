@@ -56,11 +56,16 @@ type Content struct {
 // Part represents a distinct piece of content within a message.
 // A part can be text, inline data (like an image), a function call, or a function response.
 type Part struct {
+	Thought bool `json:"thought,omitempty"`
+
 	// Text contains plain text content.
 	Text string `json:"text,omitempty"`
 
 	// InlineData contains base64-encoded data with its MIME type (e.g., images).
 	InlineData *InlineData `json:"inlineData,omitempty"`
+
+	// ThoughtSignature is a provider-required signature that accompanies certain parts.
+	ThoughtSignature string `json:"thoughtSignature,omitempty"`
 
 	// FunctionCall represents a tool call requested by the model.
 	FunctionCall *FunctionCall `json:"functionCall,omitempty"`
@@ -82,6 +87,9 @@ type InlineData struct {
 // FunctionCall represents a tool call requested by the model.
 // It includes the function name and its arguments that the model wants to execute.
 type FunctionCall struct {
+	// ID is the identifier of the function to be called.
+	ID string `json:"id,omitempty"`
+
 	// Name is the identifier of the function to be called.
 	Name string `json:"name"`
 
@@ -92,6 +100,9 @@ type FunctionCall struct {
 // FunctionResponse represents the result of a tool execution.
 // This is sent back to the model after a tool call has been processed.
 type FunctionResponse struct {
+	// ID is the identifier of the function to be called.
+	ID string `json:"id,omitempty"`
+
 	// Name is the identifier of the function that was called.
 	Name string `json:"name"`
 

@@ -24,18 +24,23 @@ func DoClaudeLogin(cfg *config.Config, options *LoginOptions) {
 		options = &LoginOptions{}
 	}
 
+	promptFn := options.Prompt
+	if promptFn == nil {
+		promptFn = defaultProjectPrompt()
+	}
+
 	manager := newAuthManager()
 
 	authOpts := &sdkAuth.LoginOptions{
-		NoBrowser: options.NoBrowser,
-		Metadata:  map[string]string{},
-		Prompt:    options.Prompt,
+		NoBrowser:    options.NoBrowser,
+		CallbackPort: options.CallbackPort,
+		Metadata:     map[string]string{},
+		Prompt:       promptFn,
 	}
 
 	_, savedPath, err := manager.Login(context.Background(), "claude", cfg, authOpts)
 	if err != nil {
-		var authErr *claude.AuthenticationError
-		if errors.As(err, &authErr) {
+		if authErr, ok := errors.AsType[*claude.AuthenticationError](err); ok {
 			log.Error(claude.GetUserFriendlyMessage(authErr))
 			if authErr.Type == claude.ErrPortInUse.Type {
 				os.Exit(claude.ErrPortInUse.Code)

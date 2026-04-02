@@ -26,8 +26,7 @@ func (a *IFlowAuthenticator) Provider() string { return "iflow" }
 
 // RefreshLead indicates how soon before expiry a refresh should be attempted.
 func (a *IFlowAuthenticator) RefreshLead() *time.Duration {
-	d := 24 * time.Hour
-	return &d
+	return new(24 * time.Hour)
 }
 
 // Login performs the OAuth code flow using a local callback server.
@@ -42,9 +41,14 @@ func (a *IFlowAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 		opts = &LoginOptions{}
 	}
 
+	callbackPort := iflow.CallbackPort
+	if opts.CallbackPort > 0 {
+		callbackPort = opts.CallbackPort
+	}
+
 	authSvc := iflow.NewIFlowAuth(cfg)
 
-	oauthServer := iflow.NewOAuthServer(iflow.CallbackPort)
+	oauthServer := iflow.NewOAuthServer(callbackPort)
 	if err := oauthServer.Start(); err != nil {
 		if strings.Contains(err.Error(), "already in use") {
 			return nil, fmt.Errorf("iflow authentication server port in use: %w", err)
@@ -64,29 +68,90 @@ func (a *IFlowAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 		return nil, fmt.Errorf("iflow auth: failed to generate state: %w", err)
 	}
 
-	authURL, redirectURI := authSvc.AuthorizationURL(state, iflow.CallbackPort)
+	authURL, redirectURI := authSvc.AuthorizationURL(state, callbackPort)
 
 	if !opts.NoBrowser {
 		fmt.Println("Opening browser for iFlow authentication")
 		if !browser.IsAvailable() {
 			log.Warn("No browser available; please open the URL manually")
-			util.PrintSSHTunnelInstructions(iflow.CallbackPort)
+			util.PrintSSHTunnelInstructions(callbackPort)
 			fmt.Printf("Visit the following URL to continue authentication:\n%s\n", authURL)
 		} else if err = browser.OpenURL(authURL); err != nil {
 			log.Warnf("Failed to open browser automatically: %v", err)
-			util.PrintSSHTunnelInstructions(iflow.CallbackPort)
+			util.PrintSSHTunnelInstructions(callbackPort)
 			fmt.Printf("Visit the following URL to continue authentication:\n%s\n", authURL)
 		}
 	} else {
-		util.PrintSSHTunnelInstructions(iflow.CallbackPort)
+		util.PrintSSHTunnelInstructions(callbackPort)
 		fmt.Printf("Visit the following URL to continue authentication:\n%s\n", authURL)
 	}
 
 	fmt.Println("Waiting for iFlow authentication callback...")
 
-	result, err := oauthServer.WaitForCallback(5 * time.Minute)
-	if err != nil {
-		return nil, fmt.Errorf("iflow auth: callback wait failed: %w", err)
+	callbackCh := make(chan *iflow.OAuthResult, 1)
+	callbackErrCh := make(chan error, 1)
+
+	go func() {
+		result, errWait := oauthServer.WaitForCallback(5 * time.Minute)
+		if errWait != nil {
+			callbackErrCh <- errWait
+			return
+		}
+		callbackCh <- result
+	}()
+
+	var result *iflow.OAuthResult
+	var manualPromptTimer *time.Timer
+	var manualPromptC <-chan time.Time
+	if opts.Prompt != nil {
+		manualPromptTimer = time.NewTimer(15 * time.Second)
+		manualPromptC = manualPromptTimer.C
+		defer manualPromptTimer.Stop()
+	}
+
+	var manualInputCh <-chan string
+	var manualInputErrCh <-chan error
+
+waitForCallback:
+	for {
+		select {
+		case result = <-callbackCh:
+			break waitForCallback
+		case err = <-callbackErrCh:
+			return nil, fmt.Errorf("iflow auth: callback wait failed: %w", err)
+		case <-manualPromptC:
+			manualPromptC = nil
+			if manualPromptTimer != nil {
+				manualPromptTimer.Stop()
+			}
+			select {
+			case result = <-callbackCh:
+				break waitForCallback
+			case err = <-callbackErrCh:
+				return nil, fmt.Errorf("iflow auth: callback wait failed: %w", err)
+			default:
+			}
+			manualInputCh, manualInputErrCh = misc.AsyncPrompt(opts.Prompt, "Paste the iFlow callback URL (or press Enter to keep waiting): ")
+			continue
+		case input := <-manualInputCh:
+			manualInputCh = nil
+			manualInputErrCh = nil
+			parsed, errParse := misc.ParseOAuthCallback(input)
+			if errParse != nil {
+				return nil, errParse
+			}
+			if parsed == nil {
+				continue
+			}
+			result = &iflow.OAuthResult{
+				Code:  parsed.Code,
+				State: parsed.State,
+				Error: parsed.Error,
+			}
+			break waitForCallback
+		case errManual := <-manualInputErrCh:
+			return nil, errManual
+		}
 	}
 	if result.Error != "" {
 		return nil, fmt.Errorf("iflow auth: provider returned error %s", result.Error)
@@ -107,7 +172,7 @@ func (a *IFlowAuthenticator) Login(ctx context.Context, cfg *config.Config, opts
 		return nil, fmt.Errorf("iflow authentication failed: missing account identifier")
 	}
 
-	fileName := fmt.Sprintf("iflow-%s.json", email)
+	fileName := fmt.Sprintf("iflow-%s-%d.json", email, time.Now().Unix())
 	metadata := map[string]any{
 		"email":         email,
 		"api_key":       tokenStorage.APIKey,

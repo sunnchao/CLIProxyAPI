@@ -4,9 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/fs"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -61,12 +65,21 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 		return "", fmt.Errorf("auth filestore: create dir failed: %w", err)
 	}
 
+	// metadataSetter is a private interface for TokenStorage implementations that support metadata injection.
+	type metadataSetter interface {
+		SetMetadata(map[string]any)
+	}
+
 	switch {
 	case auth.Storage != nil:
+		if setter, ok := auth.Storage.(metadataSetter); ok {
+			setter.SetMetadata(auth.Metadata)
+		}
 		if err = auth.Storage.SaveTokenToFile(path); err != nil {
 			return "", err
 		}
 	case auth.Metadata != nil:
+		auth.Metadata["disabled"] = auth.Disabled
 		raw, errMarshal := json.Marshal(auth.Metadata)
 		if errMarshal != nil {
 			return "", fmt.Errorf("auth filestore: marshal metadata failed: %w", errMarshal)
@@ -75,15 +88,23 @@ func (s *FileTokenStore) Save(ctx context.Context, auth *cliproxyauth.Auth) (str
 			if jsonEqual(existing, raw) {
 				return path, nil
 			}
-		} else if errRead != nil && !os.IsNotExist(errRead) {
+			file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600)
+			if errOpen != nil {
+				return "", fmt.Errorf("auth filestore: open existing failed: %w", errOpen)
+			}
+			if _, errWrite := file.Write(raw); errWrite != nil {
+				_ = file.Close()
+				return "", fmt.Errorf("auth filestore: write existing failed: %w", errWrite)
+			}
+			if errClose := file.Close(); errClose != nil {
+				return "", fmt.Errorf("auth filestore: close existing failed: %w", errClose)
+			}
+			return path, nil
+		} else if !os.IsNotExist(errRead) {
 			return "", fmt.Errorf("auth filestore: read existing failed: %w", errRead)
 		}
-		tmp := path + ".tmp"
-		if errWrite := os.WriteFile(tmp, raw, 0o600); errWrite != nil {
-			return "", fmt.Errorf("auth filestore: write temp failed: %w", errWrite)
-		}
-		if errRename := os.Rename(tmp, path); errRename != nil {
-			return "", fmt.Errorf("auth filestore: rename failed: %w", errRename)
+		if errWrite := os.WriteFile(path, raw, 0o600); errWrite != nil {
+			return "", fmt.Errorf("auth filestore: write file failed: %w", errWrite)
 		}
 	default:
 		return "", fmt.Errorf("auth filestore: nothing to persist for %s", auth.ID)
@@ -176,17 +197,53 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 	if provider == "" {
 		provider = "unknown"
 	}
+	if provider == "antigravity" || provider == "gemini" {
+		projectID := ""
+		if pid, ok := metadata["project_id"].(string); ok {
+			projectID = strings.TrimSpace(pid)
+		}
+		if projectID == "" {
+			accessToken := extractAccessToken(metadata)
+			// For gemini type, the stored access_token is likely expired (~1h lifetime).
+			// Refresh it using the long-lived refresh_token before querying.
+			if provider == "gemini" {
+				if tokenMap, ok := metadata["token"].(map[string]any); ok {
+					if refreshed, errRefresh := refreshGeminiAccessToken(tokenMap, http.DefaultClient); errRefresh == nil {
+						accessToken = refreshed
+					}
+				}
+			}
+			if accessToken != "" {
+				fetchedProjectID, errFetch := FetchAntigravityProjectID(context.Background(), accessToken, http.DefaultClient)
+				if errFetch == nil && strings.TrimSpace(fetchedProjectID) != "" {
+					metadata["project_id"] = strings.TrimSpace(fetchedProjectID)
+					if raw, errMarshal := json.Marshal(metadata); errMarshal == nil {
+						if file, errOpen := os.OpenFile(path, os.O_WRONLY|os.O_TRUNC, 0o600); errOpen == nil {
+							_, _ = file.Write(raw)
+							_ = file.Close()
+						}
+					}
+				}
+			}
+		}
+	}
 	info, err := os.Stat(path)
 	if err != nil {
 		return nil, fmt.Errorf("stat file: %w", err)
 	}
 	id := s.idFor(path, baseDir)
+	disabled, _ := metadata["disabled"].(bool)
+	status := cliproxyauth.StatusActive
+	if disabled {
+		status = cliproxyauth.StatusDisabled
+	}
 	auth := &cliproxyauth.Auth{
 		ID:               id,
 		Provider:         provider,
 		FileName:         id,
 		Label:            s.labelFor(metadata),
-		Status:           cliproxyauth.StatusActive,
+		Status:           status,
+		Disabled:         disabled,
 		Attributes:       map[string]string{"path": path},
 		Metadata:         metadata,
 		CreatedAt:        info.ModTime(),
@@ -201,14 +258,17 @@ func (s *FileTokenStore) readAuthFile(path, baseDir string) (*cliproxyauth.Auth,
 }
 
 func (s *FileTokenStore) idFor(path, baseDir string) string {
-	if baseDir == "" {
-		return path
+	id := path
+	if baseDir != "" {
+		if rel, errRel := filepath.Rel(baseDir, path); errRel == nil && rel != "" {
+			id = rel
+		}
 	}
-	rel, err := filepath.Rel(baseDir, path)
-	if err != nil {
-		return path
+	// On Windows, normalize ID casing to avoid duplicate auth entries caused by case-insensitive paths.
+	if runtime.GOOS == "windows" {
+		id = strings.ToLower(id)
 	}
-	return rel
+	return id
 }
 
 func (s *FileTokenStore) resolveAuthPath(auth *cliproxyauth.Auth) (string, error) {
@@ -264,6 +324,68 @@ func (s *FileTokenStore) baseDirSnapshot() string {
 	return s.baseDir
 }
 
+func extractAccessToken(metadata map[string]any) string {
+	if at, ok := metadata["access_token"].(string); ok {
+		if v := strings.TrimSpace(at); v != "" {
+			return v
+		}
+	}
+	if tokenMap, ok := metadata["token"].(map[string]any); ok {
+		if at, ok := tokenMap["access_token"].(string); ok {
+			if v := strings.TrimSpace(at); v != "" {
+				return v
+			}
+		}
+	}
+	return ""
+}
+
+func refreshGeminiAccessToken(tokenMap map[string]any, httpClient *http.Client) (string, error) {
+	refreshToken, _ := tokenMap["refresh_token"].(string)
+	clientID, _ := tokenMap["client_id"].(string)
+	clientSecret, _ := tokenMap["client_secret"].(string)
+	tokenURI, _ := tokenMap["token_uri"].(string)
+
+	if refreshToken == "" || clientID == "" || clientSecret == "" {
+		return "", fmt.Errorf("missing refresh credentials")
+	}
+	if tokenURI == "" {
+		tokenURI = "https://oauth2.googleapis.com/token"
+	}
+
+	data := url.Values{
+		"grant_type":    {"refresh_token"},
+		"refresh_token": {refreshToken},
+		"client_id":     {clientID},
+		"client_secret": {clientSecret},
+	}
+
+	resp, err := httpClient.PostForm(tokenURI, data)
+	if err != nil {
+		return "", fmt.Errorf("refresh request: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("refresh failed: status %d", resp.StatusCode)
+	}
+
+	var result map[string]any
+	if errUnmarshal := json.Unmarshal(body, &result); errUnmarshal != nil {
+		return "", fmt.Errorf("decode refresh response: %w", errUnmarshal)
+	}
+
+	newAccessToken, _ := result["access_token"].(string)
+	if newAccessToken == "" {
+		return "", fmt.Errorf("no access_token in refresh response")
+	}
+
+	tokenMap["access_token"] = newAccessToken
+	return newAccessToken, nil
+}
+
+// jsonEqual compares two JSON blobs by parsing them into Go objects and deep comparing.
 func jsonEqual(a, b []byte) bool {
 	var objA any
 	var objB any

@@ -44,7 +44,11 @@ func (a *GeminiAuthenticator) Login(ctx context.Context, cfg *config.Config, opt
 	}
 
 	geminiAuth := gemini.NewGeminiAuth()
-	_, err := geminiAuth.GetAuthenticatedClient(ctx, &ts, cfg, opts.NoBrowser)
+	_, err := geminiAuth.GetAuthenticatedClient(ctx, &ts, cfg, &gemini.WebLoginOptions{
+		NoBrowser:    opts.NoBrowser,
+		CallbackPort: opts.CallbackPort,
+		Prompt:       opts.Prompt,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("gemini authentication failed: %w", err)
 	}
