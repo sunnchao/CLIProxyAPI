@@ -1,3 +1,13 @@
+FROM node:22-alpine AS frontend-builder
+
+WORKDIR /frontend
+
+RUN apk add --no-cache git && \
+    git clone https://github.com/router-for-me/Cli-Proxy-API-Management-Center.git . && \
+    npm install && \
+    npm run build && \
+    mv dist/index.html dist/management.html
+
 FROM golang:1.26-alpine AS builder
 
 WORKDIR /app
@@ -23,7 +33,7 @@ RUN mkdir /CLIProxyAPI
 COPY --from=builder ./app/CLIProxyAPI /CLIProxyAPI/CLIProxyAPI
 
 COPY config.example.yaml /CLIProxyAPI/config.example.yaml
-COPY static/management.html /CLIProxyAPI/static/management.html
+COPY --from=frontend-builder /frontend/dist/management.html /CLIProxyAPI/static/management.html
 
 WORKDIR /CLIProxyAPI
 
