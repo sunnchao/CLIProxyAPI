@@ -33,7 +33,6 @@ import (
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
-	"gopkg.in/yaml.v3"
 )
 
 var (
@@ -239,24 +238,16 @@ func main() {
 	// Determine and load the configuration file.
 	// Prefer the Postgres store when configured, otherwise fallback to git or local files.
 	var configFilePath string
-	usage.SetUsagePersister(nil)
 	if usePostgresStore {
-		legacyConfigPath, legacyAuthDir, errLegacy := discoverLegacyLocalPaths(configPath, wd)
-		if errLegacy != nil {
-			log.Errorf("failed to discover legacy local workspace: %v", errLegacy)
-			return
-		}
 		if pgStoreLocalPath == "" {
 			pgStoreLocalPath = wd
 		}
 		pgStoreLocalPath = filepath.Join(pgStoreLocalPath, "pgstore")
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		pgStoreInst, err = store.NewPostgresStore(ctx, store.PostgresStoreConfig{
-			DSN:              pgStoreDSN,
-			Schema:           pgStoreSchema,
-			SpoolDir:         pgStoreLocalPath,
-			LegacyConfigPath: legacyConfigPath,
-			LegacyAuthDir:    legacyAuthDir,
+			DSN:      pgStoreDSN,
+			Schema:   pgStoreSchema,
+			SpoolDir: pgStoreLocalPath,
 		})
 		cancel()
 		if err != nil {
@@ -275,10 +266,6 @@ func main() {
 		cfg, err = config.LoadConfigOptional(configFilePath, isCloudDeploy)
 		if err == nil {
 			cfg.AuthDir = pgStoreInst.AuthDir()
-			usage.SetUsagePersister(pgStoreInst)
-			if errUsage := usage.RestorePersistedStatistics(context.Background(), usage.GetRequestStatistics()); errUsage != nil {
-				log.WithError(errUsage).Warn("failed to restore persisted usage statistics from postgres")
-			}
 			log.Infof("postgres-backed token store enabled, workspace path: %s", pgStoreInst.WorkDir())
 		}
 	} else if useObjectStore {
@@ -598,40 +585,4 @@ func main() {
 			cmd.StartService(cfg, configFilePath, password)
 		}
 	}
-}
-
-type legacyConfigProbe struct {
-	AuthDir string `yaml:"auth-dir"`
-}
-
-func discoverLegacyLocalPaths(configPath, wd string) (string, string, error) {
-	legacyConfigPath := strings.TrimSpace(configPath)
-	if legacyConfigPath == "" {
-		legacyConfigPath = filepath.Join(wd, "config.yaml")
-	}
-	defaultAuthDir, err := util.ResolveAuthDir("~/.cli-proxy-api")
-	if err != nil {
-		return "", "", fmt.Errorf("resolve default auth dir: %w", err)
-	}
-
-	data, err := os.ReadFile(legacyConfigPath)
-	if err != nil {
-		if errors.Is(err, os.ErrNotExist) || errors.Is(err, fs.ErrNotExist) {
-			return legacyConfigPath, defaultAuthDir, nil
-		}
-		return "", "", fmt.Errorf("read legacy config %s: %w", legacyConfigPath, err)
-	}
-
-	var probe legacyConfigProbe
-	if err := yaml.Unmarshal(data, &probe); err != nil {
-		return "", "", fmt.Errorf("parse legacy config %s: %w", legacyConfigPath, err)
-	}
-	if strings.TrimSpace(probe.AuthDir) == "" {
-		return legacyConfigPath, defaultAuthDir, nil
-	}
-	authDir, err := util.ResolveAuthDir(probe.AuthDir)
-	if err != nil {
-		return "", "", fmt.Errorf("resolve legacy auth dir from %s: %w", legacyConfigPath, err)
-	}
-	return legacyConfigPath, authDir, nil
 }

@@ -5,8 +5,6 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	coreusage "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/usage"
 )
 
 // UsageEvent is the normalized, deduplicated representation persisted for one request.
@@ -58,53 +56,6 @@ func PersistSnapshot(ctx context.Context, snapshot StatisticsSnapshot) error {
 		ctx = context.Background()
 	}
 	return p.PersistUsageSnapshot(ctx, snapshot)
-}
-
-// RestorePersistedStatistics rebuilds the provided in-memory store from durable events.
-func RestorePersistedStatistics(ctx context.Context, stats *RequestStatistics) error {
-	p := GetUsagePersister()
-	if p == nil || stats == nil {
-		return nil
-	}
-	if ctx == nil {
-		ctx = context.Background()
-	}
-	events, err := p.LoadUsageEvents(ctx)
-	if err != nil {
-		return err
-	}
-	stats.Reset()
-	for _, event := range events {
-		stats.RecordEvent(event)
-	}
-	return nil
-}
-
-// NewUsageEventFromRecord normalizes a runtime usage record for aggregation and persistence.
-func NewUsageEventFromRecord(ctx context.Context, record coreusage.Record) UsageEvent {
-	timestamp := record.RequestedAt
-	if timestamp.IsZero() {
-		timestamp = time.Now()
-	}
-	failed := record.Failed
-	if !failed {
-		failed = !resolveSuccess(ctx)
-	}
-	apiName := strings.TrimSpace(record.APIKey)
-	if apiName == "" {
-		apiName = resolveAPIIdentifier(ctx, record)
-	}
-	return newUsageEvent(
-		apiName,
-		record.Model,
-		RequestDetail{
-			Timestamp: timestamp,
-			Source:    record.Source,
-			AuthIndex: record.AuthIndex,
-			Tokens:    normaliseDetail(record.Detail),
-			Failed:    failed,
-		},
-	)
 }
 
 // NewUsageEventFromSnapshot normalizes snapshot details for persistence and deduplication.
