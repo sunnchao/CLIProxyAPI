@@ -345,6 +345,20 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 			},
 			wantLen: 1,
 		},
+		{
+			name: "disabled provider skipped",
+			compat: []config.OpenAICompatibility{
+				{
+					Name:    "DisabledProvider",
+					Enabled: boolPtr(false),
+					BaseURL: "https://disabled.api.com",
+					APIKeyEntries: []config.OpenAICompatibilityAPIKey{
+						{APIKey: "key-1"},
+					},
+				},
+			},
+			wantLen: 0,
+		},
 	}
 
 	for _, tt := range tests {
@@ -368,6 +382,8 @@ func TestConfigSynthesizer_OpenAICompat(t *testing.T) {
 		})
 	}
 }
+
+func boolPtr(v bool) *bool { return &v }
 
 func TestConfigSynthesizer_VertexCompat(t *testing.T) {
 	synth := NewConfigSynthesizer()
@@ -508,6 +524,37 @@ func TestConfigSynthesizer_OpenAICompat_FallbackWithModels(t *testing.T) {
 	}
 	if auths[0].Attributes["header:X-API"] != "header-value" {
 		t.Errorf("expected header:X-API=header-value, got %s", auths[0].Attributes["header:X-API"])
+	}
+}
+
+func TestConfigSynthesizer_OpenAICompat_WithResponsesEnabled(t *testing.T) {
+	synth := NewConfigSynthesizer()
+	ctx := &SynthesisContext{
+		Config: &config.Config{
+			OpenAICompatibility: []config.OpenAICompatibility{
+				{
+					Name:             "ResponsesProvider",
+					BaseURL:          "https://responses.api.com",
+					ResponsesEnabled: boolPtr(true),
+					APIKeyEntries: []config.OpenAICompatibilityAPIKey{
+						{APIKey: "key-with-responses"},
+					},
+				},
+			},
+		},
+		Now:         time.Now(),
+		IDGenerator: NewStableIDGenerator(),
+	}
+
+	auths, err := synth.Synthesize(ctx)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if len(auths) != 1 {
+		t.Fatalf("expected 1 auth, got %d", len(auths))
+	}
+	if auths[0].Attributes["responses_enabled"] != "true" {
+		t.Fatalf("expected responses_enabled=true, got %q", auths[0].Attributes["responses_enabled"])
 	}
 }
 

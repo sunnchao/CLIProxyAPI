@@ -65,7 +65,13 @@ func describeOpenAICompatibilityUpdate(oldEntry, newEntry config.OpenAICompatibi
 	newKeyCount := countAPIKeys(newEntry)
 	oldModelCount := countOpenAIModels(oldEntry.Models)
 	newModelCount := countOpenAIModels(newEntry.Models)
-	details := make([]string, 0, 3)
+	details := make([]string, 0, 5)
+	if oldEntry.IsEnabled() != newEntry.IsEnabled() {
+		details = append(details, fmt.Sprintf("enabled %t -> %t", oldEntry.IsEnabled(), newEntry.IsEnabled()))
+	}
+	if oldEntry.IsResponsesEnabled() != newEntry.IsResponsesEnabled() {
+		details = append(details, fmt.Sprintf("responses %t -> %t", oldEntry.IsResponsesEnabled(), newEntry.IsResponsesEnabled()))
+	}
 	if oldKeyCount != newKeyCount {
 		details = append(details, fmt.Sprintf("api-keys %d -> %d", oldKeyCount, newKeyCount))
 	}
@@ -142,7 +148,9 @@ func openAICompatSignature(entry config.OpenAICompatibility) string {
 	if v := strings.TrimSpace(entry.BaseURL); v != "" {
 		parts = append(parts, "base="+v)
 	}
-
+	if entry.IsResponsesEnabled() {
+		parts = append(parts, "responses=true")
+	}
 	models := make([]string, 0, len(entry.Models))
 	for _, model := range entry.Models {
 		name := strings.TrimSpace(model.Name)

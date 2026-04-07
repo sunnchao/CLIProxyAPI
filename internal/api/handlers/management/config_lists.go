@@ -394,12 +394,14 @@ func (h *Handler) PutOpenAICompat(c *gin.Context) {
 }
 func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	type openAICompatPatch struct {
-		Name          *string                             `json:"name"`
-		Prefix        *string                             `json:"prefix"`
-		BaseURL       *string                             `json:"base-url"`
-		APIKeyEntries *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
-		Models        *[]config.OpenAICompatibilityModel  `json:"models"`
-		Headers       *map[string]string                  `json:"headers"`
+		Enabled          *bool                               `json:"enabled"`
+		Name             *string                             `json:"name"`
+		Prefix           *string                             `json:"prefix"`
+		BaseURL          *string                             `json:"base-url"`
+		ResponsesEnabled *bool                               `json:"responses-enabled"`
+		APIKeyEntries    *[]config.OpenAICompatibilityAPIKey `json:"api-key-entries"`
+		Models           *[]config.OpenAICompatibilityModel  `json:"models"`
+		Headers          *map[string]string                  `json:"headers"`
 	}
 	var body struct {
 		Name  *string            `json:"name"`
@@ -429,6 +431,10 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 	}
 
 	entry := h.cfg.OpenAICompatibility[targetIndex]
+	if body.Value.Enabled != nil {
+		enabled := *body.Value.Enabled
+		entry.Enabled = &enabled
+	}
 	if body.Value.Name != nil {
 		entry.Name = strings.TrimSpace(*body.Value.Name)
 	}
@@ -444,6 +450,10 @@ func (h *Handler) PatchOpenAICompat(c *gin.Context) {
 			return
 		}
 		entry.BaseURL = trimmed
+	}
+	if body.Value.ResponsesEnabled != nil {
+		responsesEnabled := *body.Value.ResponsesEnabled
+		entry.ResponsesEnabled = &responsesEnabled
 	}
 	if body.Value.APIKeyEntries != nil {
 		entry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), (*body.Value.APIKeyEntries)...)
@@ -944,6 +954,8 @@ func normalizeOpenAICompatibilityEntry(entry *config.OpenAICompatibility) {
 	if entry == nil {
 		return
 	}
+	entry.Name = strings.TrimSpace(entry.Name)
+	entry.Prefix = strings.TrimSpace(entry.Prefix)
 	// Trim base-url; empty base-url indicates provider should be removed by sanitization
 	entry.BaseURL = strings.TrimSpace(entry.BaseURL)
 	entry.Headers = config.NormalizeHeaders(entry.Headers)
@@ -967,6 +979,10 @@ func normalizedOpenAICompatibilityEntries(entries []config.OpenAICompatibility) 
 		if len(copyEntry.APIKeyEntries) > 0 {
 			copyEntry.APIKeyEntries = append([]config.OpenAICompatibilityAPIKey(nil), copyEntry.APIKeyEntries...)
 		}
+		enabled := copyEntry.IsEnabled()
+		copyEntry.Enabled = &enabled
+		responsesEnabled := copyEntry.IsResponsesEnabled()
+		copyEntry.ResponsesEnabled = &responsesEnabled
 		normalizeOpenAICompatibilityEntry(&copyEntry)
 		out[i] = copyEntry
 	}

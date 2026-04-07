@@ -49,6 +49,7 @@ _bmad-output/*
 # macOS
 .DS_Store
 ._*
+cache
 
 # Opencode
 .beads/

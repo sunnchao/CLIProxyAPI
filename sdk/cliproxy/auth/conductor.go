@@ -1661,6 +1661,9 @@ func resolveOpenAICompatConfig(cfg *internalconfig.Config, providerKey, compatNa
 	}
 	for i := range cfg.OpenAICompatibility {
 		compat := &cfg.OpenAICompatibility[i]
+		if !compat.IsEnabled() {
+			continue
+		}
 		for _, candidate := range candidates {
 			if candidate != "" && strings.EqualFold(strings.TrimSpace(candidate), compat.Name) {
 				return compat

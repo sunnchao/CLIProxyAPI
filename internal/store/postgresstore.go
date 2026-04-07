@@ -22,16 +22,20 @@ import (
 const (
 	defaultConfigTable = "config_store"
 	defaultAuthTable   = "auth_store"
+	defaultUsageTable  = "usage_events"
 	defaultConfigKey   = "config"
 )
 
 // PostgresStoreConfig captures configuration required to initialize a Postgres-backed store.
 type PostgresStoreConfig struct {
-	DSN         string
-	Schema      string
-	ConfigTable string
-	AuthTable   string
-	SpoolDir    string
+	DSN              string
+	Schema           string
+	ConfigTable      string
+	AuthTable        string
+	UsageTable       string
+	SpoolDir         string
+	LegacyConfigPath string
+	LegacyAuthDir    string
 }
 
 // PostgresStore persists configuration and authentication metadata using PostgreSQL as backend
@@ -57,6 +61,9 @@ func NewPostgresStore(ctx context.Context, cfg PostgresStoreConfig) (*PostgresSt
 	}
 	if cfg.AuthTable == "" {
 		cfg.AuthTable = defaultAuthTable
+	}
+	if cfg.UsageTable == "" {
+		cfg.UsageTable = defaultUsageTable
 	}
 
 	spoolRoot := strings.TrimSpace(cfg.SpoolDir)
@@ -140,12 +147,35 @@ func (s *PostgresStore) EnsureSchema(ctx context.Context) error {
 	`, authTable)); err != nil {
 		return fmt.Errorf("postgres store: create auth table: %w", err)
 	}
+	usageTable := s.fullTableName(s.cfg.UsageTable)
+	if _, err := s.db.ExecContext(ctx, fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			event_key TEXT PRIMARY KEY,
+			requested_at TIMESTAMPTZ NOT NULL,
+			api_name TEXT NOT NULL,
+			model TEXT NOT NULL,
+			source TEXT NOT NULL,
+			auth_index TEXT NOT NULL,
+			failed BOOLEAN NOT NULL,
+			input_tokens BIGINT NOT NULL,
+			output_tokens BIGINT NOT NULL,
+			reasoning_tokens BIGINT NOT NULL,
+			cached_tokens BIGINT NOT NULL,
+			total_tokens BIGINT NOT NULL,
+			created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+		)
+	`, usageTable)); err != nil {
+		return fmt.Errorf("postgres store: create usage table: %w", err)
+	}
 	return nil
 }
 
 // Bootstrap synchronizes configuration and auth records between PostgreSQL and the local workspace.
 func (s *PostgresStore) Bootstrap(ctx context.Context, exampleConfigPath string) error {
 	if err := s.EnsureSchema(ctx); err != nil {
+		return err
+	}
+	if err := s.ImportLegacyLocalIfNeeded(ctx); err != nil {
 		return err
 	}
 	if err := s.syncConfigFromDatabase(ctx, exampleConfigPath); err != nil {
@@ -399,23 +429,21 @@ func (s *PostgresStore) syncConfigFromDatabase(ctx context.Context, exampleConfi
 	err := s.db.QueryRowContext(ctx, query, defaultConfigKey).Scan(&content)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
-		if _, errStat := os.Stat(s.configPath); errors.Is(errStat, fs.ErrNotExist) {
-			if exampleConfigPath != "" {
-				if errCopy := misc.CopyConfigTemplate(exampleConfigPath, s.configPath); errCopy != nil {
-					return fmt.Errorf("postgres store: copy example config: %w", errCopy)
-				}
-			} else {
-				if errCreate := os.MkdirAll(filepath.Dir(s.configPath), 0o700); errCreate != nil {
-					return fmt.Errorf("postgres store: prepare config directory: %w", errCreate)
-				}
-				if errWrite := os.WriteFile(s.configPath, []byte{}, 0o600); errWrite != nil {
-					return fmt.Errorf("postgres store: create empty config: %w", errWrite)
-				}
+		if err = os.MkdirAll(filepath.Dir(s.configPath), 0o700); err != nil {
+			return fmt.Errorf("postgres store: prepare config directory: %w", err)
+		}
+		if exampleConfigPath != "" {
+			if errCopy := misc.CopyConfigTemplate(exampleConfigPath, s.configPath); errCopy != nil {
+				return fmt.Errorf("postgres store: copy example config: %w", errCopy)
+			}
+		} else {
+			if errWrite := os.WriteFile(s.configPath, []byte{}, 0o600); errWrite != nil {
+				return fmt.Errorf("postgres store: create empty config: %w", errWrite)
 			}
 		}
 		data, errRead := os.ReadFile(s.configPath)
 		if errRead != nil {
-			return fmt.Errorf("postgres store: read local config: %w", errRead)
+			return fmt.Errorf("postgres store: read seeded config: %w", errRead)
 		}
 		if errPersist := s.persistConfig(ctx, data); errPersist != nil {
 			return errPersist

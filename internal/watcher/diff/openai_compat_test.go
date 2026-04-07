@@ -67,6 +67,48 @@ func TestDiffOpenAICompatibility_RemovedAndUnchanged(t *testing.T) {
 	expectContains(t, changes, "provider removed: provider-a (api-keys=1, models=1)")
 }
 
+func TestDiffOpenAICompatibility_ResponsesChange(t *testing.T) {
+	enabled := true
+	oldList := []config.OpenAICompatibility{
+		{
+			Name:    "provider-a",
+			BaseURL: "https://provider-a.example.com/v1",
+		},
+	}
+	newList := []config.OpenAICompatibility{
+		{
+			Name:             "provider-a",
+			BaseURL:          "https://provider-a.example.com/v1",
+			ResponsesEnabled: &enabled,
+		},
+	}
+
+	changes := DiffOpenAICompatibility(oldList, newList)
+	expectContains(t, changes, "provider updated: provider-a (responses false -> true)")
+}
+
+func TestDiffOpenAICompatibility_EnabledChange(t *testing.T) {
+	disabled := false
+	oldList := []config.OpenAICompatibility{
+		{
+			Name:          "provider-a",
+			APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "key-a"}},
+			Models:        []config.OpenAICompatibilityModel{{Name: "m1"}},
+		},
+	}
+	newList := []config.OpenAICompatibility{
+		{
+			Name:          "provider-a",
+			Enabled:       &disabled,
+			APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "key-a"}},
+			Models:        []config.OpenAICompatibilityModel{{Name: "m1"}},
+		},
+	}
+
+	changes := DiffOpenAICompatibility(oldList, newList)
+	expectContains(t, changes, "provider updated: provider-a (enabled true -> false)")
+}
+
 func TestOpenAICompatKeyFallbacks(t *testing.T) {
 	entry := config.OpenAICompatibility{
 		BaseURL: "http://base",
@@ -160,6 +202,13 @@ func TestOpenAICompatSignature_StableAndNormalized(t *testing.T) {
 	c.Models = append(c.Models, config.OpenAICompatibilityModel{Name: "m2"})
 	if sigC := openAICompatSignature(c); sigC == sigB {
 		t.Fatalf("expected signature to change when models change, got %s", sigC)
+	}
+
+	enabled := true
+	c = b
+	c.ResponsesEnabled = &enabled
+	if sigC := openAICompatSignature(c); sigC == sigB {
+		t.Fatalf("expected signature to change when responses-enabled changes, got %s", sigC)
 	}
 }
 

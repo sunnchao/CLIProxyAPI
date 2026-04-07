@@ -20,6 +20,8 @@ auths/*
 logs/*
 conv/*
 config.yaml
+!static/
+!static/management.html
 
 # Development/editor
 bin/*

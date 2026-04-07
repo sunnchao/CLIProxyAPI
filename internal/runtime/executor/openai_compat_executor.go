@@ -85,9 +85,12 @@ func (e *OpenAICompatExecutor) Execute(ctx context.Context, auth *cliproxyauth.A
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
 	endpoint := "/chat/completions"
-	if opts.Alt == "responses/compact" {
+	if e.shouldUseResponsesAPI(auth, opts) {
 		to = sdktranslator.FromString("openai-response")
-		endpoint = "/responses/compact"
+		endpoint = "/responses"
+		if opts.Alt == "responses/compact" {
+			endpoint = "/responses/compact"
+		}
 	}
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
@@ -191,6 +194,11 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 
 	from := opts.SourceFormat
 	to := sdktranslator.FromString("openai")
+	endpoint := "/chat/completions"
+	if e.shouldUseResponsesAPI(auth, opts) {
+		to = sdktranslator.FromString("openai-response")
+		endpoint = "/responses"
+	}
 	originalPayloadSource := req.Payload
 	if len(opts.OriginalRequest) > 0 {
 		originalPayloadSource = opts.OriginalRequest
@@ -207,10 +215,12 @@ func (e *OpenAICompatExecutor) ExecuteStream(ctx context.Context, auth *cliproxy
 	}
 
 	// Request usage data in the final streaming chunk so that token statistics
-	// are captured even when the upstream is an OpenAI-compatible provider.
-	translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	// are captured when using the chat completions compatibility path.
+	if to == sdktranslator.FromString("openai") {
+		translated, _ = sjson.SetBytes(translated, "stream_options.include_usage", true)
+	}
 
-	url := strings.TrimSuffix(baseURL, "/") + "/chat/completions"
+	url := strings.TrimSuffix(baseURL, "/") + endpoint
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(translated))
 	if err != nil {
 		return nil, err
@@ -352,6 +362,22 @@ func (e *OpenAICompatExecutor) resolveCredentials(auth *cliproxyauth.Auth) (base
 	return
 }
 
+func (e *OpenAICompatExecutor) shouldUseResponsesAPI(auth *cliproxyauth.Auth, opts cliproxyexecutor.Options) bool {
+	if opts.Alt == "responses/compact" {
+		return true
+	}
+	if opts.SourceFormat != sdktranslator.FromString("openai-response") {
+		return false
+	}
+	if compat := e.resolveCompatConfig(auth); compat != nil {
+		return compat.IsResponsesEnabled()
+	}
+	if auth == nil || auth.Attributes == nil {
+		return false
+	}
+	return strings.EqualFold(strings.TrimSpace(auth.Attributes["responses_enabled"]), "true")
+}
+
 func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *config.OpenAICompatibility {
 	if auth == nil || e.cfg == nil {
 		return nil
@@ -370,6 +396,9 @@ func (e *OpenAICompatExecutor) resolveCompatConfig(auth *cliproxyauth.Auth) *con
 	}
 	for i := range e.cfg.OpenAICompatibility {
 		compat := &e.cfg.OpenAICompatibility[i]
+		if !compat.IsEnabled() {
+			continue
+		}
 		for _, candidate := range candidates {
 			if candidate != "" && strings.EqualFold(strings.TrimSpace(candidate), compat.Name) {
 				return compat

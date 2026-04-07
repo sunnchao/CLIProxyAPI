@@ -210,6 +210,23 @@ func readOpenAICompatStreamPayload(t *testing.T, streamResult *cliproxyexecutor.
 	return string(payload)
 }
 
+func TestResolveOpenAICompatConfig_SkipsDisabled(t *testing.T) {
+	disabled := false
+	cfg := &internalconfig.Config{
+		OpenAICompatibility: []internalconfig.OpenAICompatibility{
+			{
+				Name:    "pool",
+				Enabled: &disabled,
+				BaseURL: "https://disabled.example.com/v1",
+			},
+		},
+	}
+
+	if got := resolveOpenAICompatConfig(cfg, "pool", "pool", "pool"); got != nil {
+		t.Fatalf("expected disabled provider to be ignored, got %+v", got)
+	}
+}
+
 func TestManagerExecuteCount_OpenAICompatAliasPoolStopsOnInvalidRequest(t *testing.T) {
 	alias := "claude-opus-4.66"
 	invalidErr := &Error{HTTPStatus: http.StatusUnprocessableEntity, Message: "unprocessable entity"}

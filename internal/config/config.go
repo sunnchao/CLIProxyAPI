@@ -487,6 +487,10 @@ type OpenAICompatibility struct {
 	// Name is the identifier for this OpenAI compatibility configuration.
 	Name string `yaml:"name" json:"name"`
 
+	// Enabled controls whether this provider participates in routing and model exposure.
+	// Nil means enabled for backward compatibility.
+	Enabled *bool `yaml:"enabled,omitempty" json:"enabled,omitempty"`
+
 	// Priority controls selection preference when multiple providers or credentials match.
 	// Higher values are preferred; defaults to 0.
 	Priority int `yaml:"priority,omitempty" json:"priority,omitempty"`
@@ -497,6 +501,11 @@ type OpenAICompatibility struct {
 	// BaseURL is the base URL for the external OpenAI-compatible API endpoint.
 	BaseURL string `yaml:"base-url" json:"base-url"`
 
+	// ResponsesEnabled controls whether /v1/responses* should be forwarded to the
+	// upstream Responses API instead of being translated through chat completions.
+	// Nil means disabled by default.
+	ResponsesEnabled *bool `yaml:"responses-enabled,omitempty" json:"responses-enabled,omitempty"`
+
 	// APIKeyEntries defines API keys with optional per-key proxy configuration.
 	APIKeyEntries []OpenAICompatibilityAPIKey `yaml:"api-key-entries,omitempty" json:"api-key-entries,omitempty"`
 
@@ -505,6 +514,18 @@ type OpenAICompatibility struct {
 
 	// Headers optionally adds extra HTTP headers for requests sent to this provider.
 	Headers map[string]string `yaml:"headers,omitempty" json:"headers,omitempty"`
+}
+
+// IsEnabled reports whether the compatibility provider should participate at runtime.
+// Nil is treated as enabled to preserve backward compatibility with older configs.
+func (c OpenAICompatibility) IsEnabled() bool {
+	return c.Enabled == nil || *c.Enabled
+}
+
+// IsResponsesEnabled reports whether /v1/responses* should use the upstream
+// Responses API directly for this provider.
+func (c OpenAICompatibility) IsResponsesEnabled() bool {
+	return c.ResponsesEnabled != nil && *c.ResponsesEnabled
 }
 
 // OpenAICompatibilityAPIKey represents an API key configuration with optional proxy setting.

@@ -61,6 +61,7 @@ func TestApplyAuthExcludedModelsMeta_OAuthProvider(t *testing.T) {
 }
 
 func TestBuildAPIKeyClientsCounts(t *testing.T) {
+	disabled := false
 	cfg := &config.Config{
 		GeminiKey: []config.GeminiKey{{APIKey: "g1"}, {APIKey: "g2"}},
 		VertexCompatAPIKey: []config.VertexCompatKey{
@@ -70,6 +71,7 @@ func TestBuildAPIKeyClientsCounts(t *testing.T) {
 		CodexKey:  []config.CodexKey{{APIKey: "x1"}, {APIKey: "x2"}},
 		OpenAICompatibility: []config.OpenAICompatibility{
 			{APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "o1"}, {APIKey: "o2"}}},
+			{Enabled: &disabled, APIKeyEntries: []config.OpenAICompatibilityAPIKey{{APIKey: "o3"}}},
 		},
 	}
 

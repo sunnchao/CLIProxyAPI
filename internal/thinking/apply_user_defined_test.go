@@ -6,6 +6,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/thinking"
 	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/claude"
+	_ "github.com/router-for-me/CLIProxyAPI/v6/internal/thinking/provider/codex"
 	"github.com/tidwall/gjson"
 )
 
@@ -51,5 +52,37 @@ func TestApplyThinking_UserDefinedClaudePreservesAdaptiveLevel(t *testing.T) {
 				t.Fatalf("thinking.budget_tokens should be removed, body=%s", string(out))
 			}
 		})
+	}
+}
+
+func TestApplyThinking_UserDefinedOpenAIResponsesAppliesReasoningEffort(t *testing.T) {
+	reg := registry.GetGlobalRegistry()
+	clientID := "test-user-defined-openai-response-" + t.Name()
+	modelID := "custom-openai-response"
+	reg.RegisterClient(clientID, "openai-response", []*registry.ModelInfo{{ID: modelID, UserDefined: true}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(clientID)
+	})
+
+	out, err := thinking.ApplyThinking([]byte(`{}`), modelID+"(high)", "codex", "openai-response", "openai-response")
+	if err != nil {
+		t.Fatalf("ApplyThinking() error = %v", err)
+	}
+
+	if got := gjson.GetBytes(out, "reasoning.effort").String(); got != "high" {
+		t.Fatalf("reasoning.effort = %q, want %q, body=%s", got, "high", string(out))
+	}
+}
+
+func TestStripThinkingConfig_OpenAIResponses(t *testing.T) {
+	body := []byte(`{"reasoning":{"effort":"high"},"input":[{"role":"user","content":"hi"}]}`)
+
+	out := thinking.StripThinkingConfig(body, "openai-response")
+
+	if gjson.GetBytes(out, "reasoning.effort").Exists() {
+		t.Fatalf("reasoning.effort should be stripped, body=%s", string(out))
+	}
+	if !gjson.GetBytes(out, "input").Exists() {
+		t.Fatalf("input should be preserved, body=%s", string(out))
 	}
 }

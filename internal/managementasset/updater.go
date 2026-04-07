@@ -85,6 +85,10 @@ func runAutoUpdater(ctx context.Context) {
 			log.Debug("management asset auto-updater skipped: config not yet available")
 			return
 		}
+		if strings.TrimSpace(os.Getenv("MANAGEMENT_STATIC_PATH")) != "" {
+			log.Debug("management asset auto-updater skipped: local management asset override configured")
+			return
+		}
 		if cfg.RemoteManagement.DisableControlPanel {
 			log.Debug("management asset auto-updater skipped: control panel disabled")
 			return
